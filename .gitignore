@@ -1,0 +1,13 @@
+/logs
+/results
+/data
+/logs_base
+/.claude
+/outputs
+*.xyz
+*.ply
+*.obj
+*.md
+*.txt
+/cpp_miq/build
+.polyscope.ini

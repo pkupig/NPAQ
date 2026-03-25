@@ -1,0 +1,65 @@
+data:
+  type: synthetic
+  k_neighbors: 32
+  consistency_queries: 6
+  consistency_radius_ratio: 0.24
+  noise_std: 0.003
+  cache: false
+  synthetic_train_points: 768
+  synthetic_val_points: 384
+  proportions:
+    cylinder: 0.20
+    torus: 0.30
+    saddle: 0.15
+    sphere: 0.10
+    ellipsoid: 0.25
+
+model:
+  k: 20
+  emb_dims: 256
+  dropout: 0.2
+  in_dims: 6
+  max_log_half: 1.5
+  predict_confidence: true
+  predict_singularity: false
+
+loss:
+  lambda_dir: 0.1
+  dir_stop_threshold: 0.05
+  lambda_sing: 0.0
+  lambda_ph: 0.0
+  ph_euler_char: 0.0
+  lambda_j: 0.0
+  lambda_conf: 0.1
+  lambda_topo: 0.012
+  topo_det_eps: 1.0e-3
+  topo_cond_max: 30.0
+  topo_entropy_weight: 0.1
+  topo_field_weight: 0.6
+  topo_ring_weight: 0.3
+  topo_charge_weight: 0.25
+  topo_turn_weight: 0.0
+  topo_cons_metric_weight: 0.9
+  topo_cons_dir_weight: 0.45
+  topo_consistency_sigma: 0.35
+  topo_ring_min_queries: 4
+  topo_warmup_epochs: 6
+  topo_warmup_start_epoch: 1
+
+training:
+  batch_size: 32
+  epochs: 10
+  lr: 0.0001
+  weight_decay: 1.0e-5
+  lr_scheduler: plateau
+  lr_decay_gamma: 0.5
+  lr_patience: 4
+  lr_min: 1.0e-6
+  lr_decay_step: 100
+  num_workers: 0
+  mixed_precision: false
+  checkpoint_dir: ./checkpoints
+  select_by: val_loss
+  early_stop_patience: 6
+  early_stop_min_delta: 1.0e-4
+  log_topo_proxy: true

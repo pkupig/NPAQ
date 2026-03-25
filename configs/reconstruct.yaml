@@ -1,0 +1,614 @@
+model:
+  k: 20
+  emb_dims: 256
+  dropout: 0.5
+
+smoothing:
+  lambda: 0.1
+  k: 10
+
+features:
+  curvature_threshold: 0.2
+  cluster_eps: 0.05
+  min_cluster_size: 10
+  line_smoothing: 0.0
+  feature_vertex_threshold: 0.05
+  feature_edge_threshold: 0.05
+  feature_vertex_threshold_edge_ratio: 0.15
+  feature_edge_threshold_edge_ratio: 0.35
+  feature_edge_min_alignment: 0.55
+  feature_edge_weight: 4.0
+  feature_edge_weight_alignment_bonus: 2.0
+  feature_edge_max_per_quad: 2
+  guidance_feature_boost_radius_ratio: 1.5
+  guidance_feature_min_confidence: 0.85
+  guidance_feature_override_radius_ratio: 1.2
+  guidance_feature_refined_boost_radius_ratio: 0.75
+  guidance_feature_refined_sample_spacing_ratio: 0.9
+  guidance_feature_refined_override_radius_ratio: 0.72
+  metric_feature_align_radius_ratio: 1.5
+  metric_feature_refined_align_radius_ratio: 0.9
+  metric_feature_min_anisotropy_ratio: 1.2
+  guidance_corner_suppress_radius_ratio: 0.9
+  guidance_corner_refined_suppress_radius_ratio: 0.36
+  guidance_corner_confidence: 0.01
+  mesh_corner_min_degree: 3
+  mesh_dihedral_threshold_deg: 25.0
+  mesh_min_polyline_vertices: 2
+  mesh_include_boundary: true
+
+miq:
+  poisson_depth: 6
+  # Cross-field parametrisation  (§5.1 – §5.3)
+  crossfield_mu: 10.0        # μ — alignment weight: cross-field follows metric tightly
+  # Umbilic handling (near isotropic curvature, e.g. sphere): smooth guidance
+  # and reduce local direction forcing to avoid arbitrary noisy principal axes.
+  umbilic_smoothing: true
+  anisotropy_eps: 0.03
+  mu_min_ratio: 0.05
+  gradient_size: 1.0         # quad density: smaller → more quads (tune: 0.5–2.0)
+  seam_int_weight: 5.0       # λ_int sinusoidal barrier penalty weight
+  integer_constraints: true  # set false only for debugging the cross-field
+  # If true, integer-grid extraction keeps only quads that form a closed
+  # 2-manifold (all edges incidence==2). Recommended for closed-surface tasks.
+  require_closed_topology: false
+  # Geometric homotopy: progressively reduce anisotropy if fully anisotropic
+  # metric fails to yield a valid integer layout.
+  anisotropy_schedule: [1.0, 0.7, 0.45, 0.25, 0.0]
+  # Global least-squares projection of edge jumps to nearest integers.
+  integer_projection_iters: 2
+  # Explicit integer vertex-potential refinement (mixed-integer alternating).
+  integer_potential_iters: 2
+  # Maximum UV distance for integer-grid vertex assignment.
+  max_param_dist: 0.7
+  # Use C++ libigl/CoMISo MIQ backend (cpp_miq/build/run_miq).
+  # Significantly better topology: true seam cutting, integer rounding, vertex welding.
+  # New (2026-03-19): quad extraction uses barycentric UV sampling instead of
+  # nearest-vertex snapping → eliminates holes from sparse mesh regions.
+  # Requires: bash cpp_miq/build.sh (first run downloads libigl ~100MB).
+  use_igl_backend: true
+  # IGL backend parameters (used when use_igl_backend=true).
+  # igl_gradient_size: controls quad density for the C++ MIQ path.
+  #   ≤0 = auto-compute from mesh average edge length (recommended).
+  #   60 = ~3x auto (21); with 81 holonomy singularities and 2.4x UV overlap,
+  #   gradient_size=60 gives ~826 quads with <20 fold-overs (vs 94 at auto=21).
+  igl_gradient_size: 80.0    # open-surface default: favor higher-quality denser quads
+  igl_stiffness: 5.0
+  igl_direct_round: false    # iterative rounding: more stable for 81 singularities
+  igl_miq_iter: 20           # 20 iterations; localIter=20 in C++
+
+pd:
+  mu: 0.1                    # γ smoothness weight in A = I + γ Lᵀ L
+  iterations: 30             # total K PD iterations
+  surface_attach_weight: 2.0 # nearest-surface attachment during PD; counters shrinkage/drift
+  flip_backtracking: true    # reject/backtrack PD steps that introduce flipped quads
+  flip_backtrack_steps: 8
+  # End-to-end gradient (§6.5): only the last `unroll_grad_iters` iterations
+  # participate in the backward pass; earlier iterations are stop-gradient.
+  unroll_grad_iters: 5
+  # Anti-flip determinant penalty (§5.3 / §6.4)
+  anti_flip_weight: 10.0
+  anti_flip_eps: 1.0e-6
+  # Gradient isolation for topology generation (§5.3).
+  # True: topology Q is fixed; gradients flow only through unrolled PD tail.
+  # False: experimental — also backprop through cross-field + parametrisation.
+  freeze_rounding_grad: true
+
+topology:
+  # Certification gate: fail-fast on invalid topology in both initial and final mesh.
+  strict: true
+  # Main output selection mode:
+  # quality   = prefer dense/high-quality valid candidate
+  # balanced  = default tradeoff between density and topology
+  # topology  = prefer topology-clean candidate as main output
+  selection_mode: balanced
+  # Keep true for open surfaces / patches; set false for closed-shape-only evaluation.
+  allow_boundary: true
+  fill_boundary_quads: true
+  fill_boundary_quads_max_loop_len: 4
+  fill_boundary_quads_iters: 4
+  stitch_boundary_pairs: true
+  stitch_boundary_pairs_max_loop_len: 24
+  stitch_boundary_pairs_max_centroid_dist_ratio: 0.2
+  zipper_self_boundary_loops: true
+  zipper_self_boundary_loops_min_loop_len: 32
+  zipper_self_boundary_loops_min_gap_ratio: 0.05
+  zipper_self_boundary_loops_max_pair_dist_ratio: 0.15
+  zipper_self_boundary_loops_iters: 3
+  post_orient_zipper: false
+  post_orient_zipper_min_loop_len: 48
+  post_orient_zipper_min_gap_ratio: 0.08
+  post_orient_zipper_max_pair_dist_ratio: 0.10
+  post_orient_zipper_iters: 1
+  repair_quality_branch_min_faces: 1500
+  repair_quality_max_mean_angle_increase_deg: 1.0
+  repair_quality_max_p90_angle_increase_deg: 2.5
+  repair_quality_max_mean_aspect_increase_ratio: 0.08
+  repair_quality_max_p90_aspect_increase_ratio: 0.12
+  repair_quality_max_mean_planarity_increase_ratio: 0.10
+  repair_quality_max_p90_planarity_increase_ratio: 0.12
+  post_pd_planarize: true
+  post_pd_planarize_iters: 1
+  post_pd_planarize_alpha: 0.2
+  post_pd_planarize_boundary_alpha_scale: 0.3
+  post_pd_planarize_min_mean_planarity_ratio: 0.94
+  post_pd_planarize_min_p90_planarity_ratio: 0.94
+  post_pd_shape_polish: false
+  post_pd_shape_polish_aspect_threshold: 3.5
+  post_pd_shape_polish_alpha: 0.18
+  post_pd_shape_polish_iters: 3
+  post_pd_shape_polish_ring_expand: 1
+  post_pd_shape_polish_max_mean_aspect_ratio: 1.001
+  post_pd_shape_polish_max_p90_aspect_ratio: 0.999
+  post_pd_shape_polish_min_angle_gain_deg: 0.01
+  post_pd_cleanup: true
+  zipper_self_closed_profiles:
+    - label: dense-tight
+      min_loop_len: 96
+      min_gap_ratio: 0.08
+      max_pair_dist_ratio: 0.18
+      iters: 2
+    - label: dense-mid
+      min_loop_len: 128
+      min_gap_ratio: 0.08
+      max_pair_dist_ratio: 0.20
+      iters: 2
+  cap_even_boundary_loops: true
+  cap_even_boundary_loops_max_loop_len: 256
+  cap_even_boundary_loops_closed_max_loop_len: 24
+  cap_even_boundary_loops_closed_max_added_faces: 12
+  closed_quality_disable_face_bridge_repairs: true
+  closed_quality_enable_face_bridge_repairs_on_boundary: true
+  closed_quality_face_bridge_min_boundary_edges: 64
+  closed_quality_face_bridge_min_boundary_loops: 2
+  cap_rectangular_boundary_loops_with_field: true
+  cap_rectangular_boundary_loops_field_max_loop_len: 1024
+  cap_rectangular_boundary_loops_field_max_grid_side: 96
+  cap_rectangular_boundary_loops_field_planar_ratio_max: 0.2
+  cap_rectangular_boundary_loops_field_align_min_strength: 0.1
+  cap_even_boundary_loops_with_field_rings: true
+  cap_even_boundary_loops_field_max_loop_len: 1024
+  cap_even_boundary_loops_field_shrink: 0.35
+  cap_even_boundary_loops_field_align_min_strength: 0.1
+  remesh_boundary_with_miq: true
+  remesh_boundary_min_edges: 200
+  remesh_boundary_min_loops: 1
+  remesh_boundary_max_faces: 60000
+  remesh_boundary_min_gain: 8
+  remesh_boundary_accept_if_better: true
+  remesh_boundary_bypass_quality_gate: true
+  prune_boundary_fragments: true
+  prune_boundary_fragments_min_faces: 50
+  prune_boundary_fragments_min_ratio: 0.25
+  max_adaptive_profiles: 4
+  selection_dense_face_ratio: 0.8
+  selection_quality_max_winding_ratio: 0.03
+  selection_quality_max_final_miq_flips: 5
+  selection_quality_max_mean_angle_increase_deg: 1.0
+  selection_quality_max_p90_angle_increase_deg: 2.5
+  selection_quality_max_mean_aspect_increase_ratio: 0.35
+  selection_quality_max_p90_aspect_increase_ratio: 0.45
+  selection_quality_max_mean_planarity_increase_ratio: 0.20
+  selection_quality_max_p90_planarity_increase_ratio: 0.25
+  selection_quality_max_mean_angle_dev: 12.0
+  selection_quality_max_p90_angle_dev: 28.0
+  selection_quality_max_mean_aspect: 1.9
+  selection_quality_max_p90_aspect: 2.5
+  selection_quality_max_mean_planarity: 0.01
+  selection_quality_max_p90_planarity: 0.10
+  selection_quality_max_stack_pairs: 24
+  selection_quality_probe_stack_pairs: true
+  selection_topology_override_face_ratio: 0.55
+  selection_topology_override_min_boundary_gain: 80
+  selection_topology_override_min_boundary_ratio: 0.2
+  selection_topology_quality_face_ratio: 0.4
+  selection_topology_max_cap_ratio: 0.2
+  selection_topology_max_repair_ratio: 0.3
+  selection_closed_dense_face_ratio: 0.65
+  selection_closed_quality_max_winding_ratio: 0.06
+  selection_closed_quality_max_final_miq_flips: 15
+  selection_closed_quality_max_mean_angle_increase_deg: 1.0
+  selection_closed_quality_max_p90_angle_increase_deg: 2.5
+  selection_closed_quality_max_mean_aspect_increase_ratio: 0.35
+  selection_closed_quality_max_p90_aspect_increase_ratio: 0.45
+  selection_closed_quality_max_mean_planarity_increase_ratio: 0.20
+  selection_closed_quality_max_p90_planarity_increase_ratio: 0.25
+  selection_closed_quality_max_mean_angle_dev: 12.0
+  selection_closed_quality_max_p90_angle_dev: 28.0
+  selection_closed_quality_max_mean_aspect: 2.2
+  selection_closed_quality_max_p90_aspect: 3.0
+  selection_closed_quality_max_mean_planarity: 0.01
+  selection_closed_quality_max_p90_planarity: 0.15
+  selection_closed_quality_max_stack_pairs: 24
+  selection_closed_quality_boundary_override_face_ratio: 0.30
+  selection_closed_quality_boundary_override_gain: 32
+  quality_post_pd_alt_promotion_enabled: true
+  quality_post_pd_alt_promotion_min_boundary_gain: 24
+  quality_post_pd_alt_promotion_min_face_ratio: 0.68
+  quality_post_pd_alt_max_mean_angle_increase_deg: 1.0
+  quality_post_pd_alt_max_p90_angle_increase_deg: 2.0
+  quality_post_pd_alt_max_mean_aspect_increase_ratio: 0.15
+  quality_post_pd_alt_max_p90_aspect_increase_ratio: 0.18
+  quality_post_pd_alt_max_mean_planarity_increase_ratio: 0.20
+  quality_post_pd_alt_max_p90_planarity_increase_ratio: 0.20
+  selection_closed_topology_override_face_ratio: 0.75
+  selection_closed_topology_override_min_boundary_gain: 250
+  selection_closed_topology_override_min_boundary_ratio: 0.45
+  selection_closed_topology_quality_face_ratio: 0.6
+  selection_closed_topology_max_cap_ratio: 0.15
+  selection_closed_topology_max_repair_ratio: 0.28
+  closed_quality_max_adaptive_profiles: 3
+  export_topology_alternative: true
+  export_triangle_preview: true
+  stack_prune_max_chain_increase: 0
+  stack_prune_max_irregular_increase: 0
+  small_sharp_vertex_threshold: 256
+  small_sharp_face_threshold: 512
+  small_sharp_feature_lines_threshold: 8
+  small_sharp_feature_samples_threshold: 24
+  small_sharp_quality_override_face_ratio: 0.25
+  small_sharp_quality_min_faces: 72
+  small_sharp_quality_boundary_override_face_ratio: 0.18
+  small_sharp_quality_boundary_override_min_faces: 52
+  small_sharp_quality_boundary_override_gain: 4
+  small_sharp_quality_dense_near_boundary_margin: 0
+  small_sharp_quality_post_pd_alt_promotion_enabled: true
+  small_sharp_quality_post_pd_alt_promotion_min_boundary_gain: 4
+  small_sharp_quality_post_pd_alt_promotion_min_face_ratio: 0.86
+  small_sharp_quality_post_pd_alt_max_mean_angle_increase_deg: 1.25
+  small_sharp_quality_post_pd_alt_max_p90_angle_increase_deg: 2.5
+  small_sharp_quality_post_pd_alt_max_mean_aspect_increase_ratio: 0.18
+  small_sharp_quality_post_pd_alt_max_p90_aspect_increase_ratio: 0.22
+  small_sharp_stack_prune_min_pair_gain: 2
+  small_sharp_stack_prune_max_boundary_increase: 8
+  small_sharp_stack_prune_max_loop_increase: 0
+  small_sharp_stack_prune_max_chain_increase: 0
+  small_sharp_stack_prune_max_irregular_increase: 0
+  small_sharp_max_adaptive_profiles: 3
+  small_sharp_field_subdivide_iters: 1
+  small_sharp_field_subdivide_max_faces: 4096
+  small_sharp_corner_charge_count: 8
+  small_sharp_corner_charge_units: 1
+  small_sharp_corner_charge_support_points: 2
+  small_sharp_corner_charge_support_radius_ratio: 0.9
+  small_sharp_closed_max_boundary_edges: 80
+  small_sharp_closed_max_boundary_loops: 1
+  small_sharp_min_quads: 48
+  small_sharp_closed_profile_overrides:
+    crossfield_mu: 12.0
+    poisson_depth: 6
+    use_igl_backend: true
+    igl_gradient_size: 10.0
+    igl_stiffness: 7.0
+    igl_direct_round: false
+    igl_miq_iter: 24
+  small_sharp_closed_quality_profile_overrides:
+    crossfield_mu: 12.0
+    poisson_depth: 6
+    use_igl_backend: true
+    igl_gradient_size: 10.0
+    igl_stiffness: 7.0
+    igl_direct_round: false
+    igl_miq_iter: 24
+  small_sharp_closed_retry_profiles:
+    - crossfield_mu: 8.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 8.0
+      igl_stiffness: 6.0
+      igl_direct_round: false
+      igl_miq_iter: 24
+    - crossfield_mu: 16.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 14.0
+      igl_stiffness: 8.5
+      igl_direct_round: false
+      igl_miq_iter: 24
+  small_sharp_closed_quality_retry_profiles:
+    - crossfield_mu: 8.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 8.0
+      igl_stiffness: 6.0
+      igl_direct_round: false
+      igl_miq_iter: 24
+    - crossfield_mu: 10.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 10.0
+      igl_stiffness: 7.0
+      igl_direct_round: false
+      igl_miq_iter: 24
+    - crossfield_mu: 6.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 10.2
+      igl_stiffness: 7.2
+      igl_direct_round: false
+      igl_miq_iter: 24
+      guidance_override_reliability_floor: 1.0
+      guidance_override_anchor_eps: 0.02
+      singularity_cancel_distance_ratio: 1.6
+      singularity_cancel_smoothing_iters: 3
+      singularity_cancel_max_rounds: 1
+      repair_high_order: false
+      repair_flow: false
+    - crossfield_mu: 6.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 11.0
+      igl_stiffness: 7.5
+      igl_direct_round: false
+      igl_miq_iter: 24
+      guidance_override_reliability_floor: 1.0
+      guidance_override_anchor_eps: 0.02
+      singularity_cancel_distance_ratio: 1.6
+      singularity_cancel_smoothing_iters: 3
+      singularity_cancel_max_rounds: 1
+      repair_high_order: false
+      repair_flow: false
+    - crossfield_mu: 7.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 11.8
+      igl_stiffness: 7.8
+      igl_direct_round: false
+      igl_miq_iter: 24
+      guidance_override_reliability_floor: 1.0
+      guidance_override_anchor_eps: 0.02
+      singularity_cancel_distance_ratio: 1.6
+      singularity_cancel_smoothing_iters: 3
+      singularity_cancel_max_rounds: 1
+      repair_high_order: false
+      repair_flow: false
+    - crossfield_mu: 6.5
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 11.0
+      igl_stiffness: 7.5
+      igl_direct_round: false
+      igl_miq_iter: 24
+      guidance_override_reliability_floor: 1.0
+      guidance_override_anchor_eps: 0.02
+      singularity_cancel_distance_ratio: 1.6
+      singularity_cancel_smoothing_iters: 3
+      singularity_cancel_max_rounds: 1
+      repair_high_order: false
+      repair_flow: false
+    - crossfield_mu: 3.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 8.64
+      igl_stiffness: 6.48
+      igl_direct_round: false
+      igl_miq_iter: 24
+      guidance_override_reliability_floor: 1.0
+      guidance_override_anchor_eps: 0.01
+      singularity_cancel_distance_ratio: 1.2
+      singularity_cancel_smoothing_iters: 2
+      singularity_cancel_max_rounds: 1
+      repair_high_order: false
+      repair_flow: false
+    - crossfield_mu: 3.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 8.0
+      igl_stiffness: 5.7
+      igl_direct_round: false
+      igl_miq_iter: 24
+      guidance_override_reliability_floor: 1.0
+      guidance_override_anchor_eps: 0.02
+      singularity_cancel_distance_ratio: 1.6
+      singularity_cancel_smoothing_iters: 3
+      singularity_cancel_max_rounds: 1
+      repair_high_order: false
+      repair_flow: false
+    - crossfield_mu: 2.5
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 7.6
+      igl_stiffness: 5.45
+      igl_direct_round: false
+      igl_miq_iter: 24
+      guidance_override_reliability_floor: 1.0
+      guidance_override_anchor_eps: 0.02
+      singularity_cancel_distance_ratio: 1.6
+      singularity_cancel_smoothing_iters: 3
+      singularity_cancel_max_rounds: 1
+      repair_high_order: false
+      repair_flow: false
+    - crossfield_mu: 2.75
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 7.8
+      igl_stiffness: 5.55
+      igl_direct_round: false
+      igl_miq_iter: 24
+      guidance_override_reliability_floor: 1.0
+      guidance_override_anchor_eps: 0.02
+      singularity_cancel_distance_ratio: 1.6
+      singularity_cancel_smoothing_iters: 3
+      singularity_cancel_max_rounds: 1
+      repair_high_order: false
+      repair_flow: false
+    - crossfield_mu: 4.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 10.0
+      igl_stiffness: 6.3
+      igl_direct_round: false
+      igl_miq_iter: 24
+      guidance_override_reliability_floor: 1.0
+      guidance_override_anchor_eps: 0.02
+      singularity_cancel_distance_ratio: 1.6
+      singularity_cancel_smoothing_iters: 3
+      singularity_cancel_max_rounds: 1
+      repair_high_order: false
+      repair_flow: false
+  # Hard gate: require at least this many quads, otherwise treat as topology failure.
+  min_quads: 80
+  # Open-surface retry profiles (merged over `miq` base params).
+  retry_profiles:
+    - crossfield_mu: 20.0
+      poisson_depth: 7
+      use_igl_backend: true
+      igl_gradient_size: 80.0
+      igl_stiffness: 5.0
+    - crossfield_mu: 30.0
+      poisson_depth: 8
+      use_igl_backend: true
+      igl_gradient_size: 80.0
+      igl_stiffness: 8.0
+    - crossfield_mu: 35.0
+      poisson_depth: 9
+      use_igl_backend: true
+      igl_gradient_size: 80.0
+      igl_stiffness: 10.0
+  # Closed-surface overrides: start from low-density stable topology and only
+  # then increase density. This keeps sphere/torus repair logic from degrading
+  # the default open-surface quality path.
+  closed_profile_overrides:
+    crossfield_mu: 10.0
+    poisson_depth: 6
+    use_igl_backend: true
+    igl_gradient_size: 20.0
+    igl_stiffness: 5.0
+  closed_quality_profile_overrides:
+    crossfield_mu: 20.0
+    poisson_depth: 7
+    use_igl_backend: true
+    igl_gradient_size: 72.0
+    igl_stiffness: 6.0
+  closed_quality_retry_profiles:
+    - crossfield_mu: 11.8
+      poisson_depth: 7
+      use_igl_backend: true
+      igl_gradient_size: 37.0
+      igl_stiffness: 4.00
+    - crossfield_mu: 11.85
+      poisson_depth: 7
+      use_igl_backend: true
+      igl_gradient_size: 37.25
+      igl_stiffness: 4.02
+    - crossfield_mu: 11.9
+      poisson_depth: 7
+      use_igl_backend: true
+      igl_gradient_size: 37.5
+      igl_stiffness: 4.05
+    - crossfield_mu: 11.95
+      poisson_depth: 7
+      use_igl_backend: true
+      igl_gradient_size: 37.75
+      igl_stiffness: 4.08
+    - crossfield_mu: 12.0
+      poisson_depth: 7
+      use_igl_backend: true
+      igl_gradient_size: 38.0
+      igl_stiffness: 4.10
+    - crossfield_mu: 12.25
+      poisson_depth: 7
+      use_igl_backend: true
+      igl_gradient_size: 39.0
+      igl_stiffness: 4.18
+    - crossfield_mu: 12.1
+      poisson_depth: 7
+      use_igl_backend: true
+      igl_gradient_size: 38.5
+      igl_stiffness: 4.12
+    - crossfield_mu: 12.5
+      poisson_depth: 7
+      use_igl_backend: true
+      igl_gradient_size: 40.0
+      igl_stiffness: 4.25
+    - crossfield_mu: 13.0
+      poisson_depth: 7
+      use_igl_backend: true
+      igl_gradient_size: 42.0
+      igl_stiffness: 4.35
+    - crossfield_mu: 14.0
+      poisson_depth: 7
+      use_igl_backend: true
+      igl_gradient_size: 44.0
+      igl_stiffness: 4.5
+    - crossfield_mu: 15.0
+      poisson_depth: 7
+      use_igl_backend: true
+      igl_gradient_size: 48.0
+      igl_stiffness: 4.75
+    - crossfield_mu: 16.0
+      poisson_depth: 7
+      use_igl_backend: true
+      igl_gradient_size: 52.0
+      igl_stiffness: 5.0
+    - crossfield_mu: 18.0
+      poisson_depth: 7
+      use_igl_backend: true
+      igl_gradient_size: 60.0
+      igl_stiffness: 5.5
+    - crossfield_mu: 25.0
+      poisson_depth: 8
+      use_igl_backend: true
+      igl_gradient_size: 76.0
+      igl_stiffness: 7.0
+    - crossfield_mu: 27.5
+      poisson_depth: 8
+      use_igl_backend: true
+      igl_gradient_size: 78.0
+      igl_stiffness: 7.5
+    - crossfield_mu: 30.0
+      poisson_depth: 8
+      use_igl_backend: true
+      igl_gradient_size: 80.0
+      igl_stiffness: 8.0
+    - crossfield_mu: 35.0
+      poisson_depth: 9
+      use_igl_backend: true
+      igl_gradient_size: 80.0
+      igl_stiffness: 10.0
+  closed_retry_profiles:
+    - crossfield_mu: 10.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 28.0
+      igl_stiffness: 5.0
+    - crossfield_mu: 10.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 32.0
+      igl_stiffness: 5.0
+    - crossfield_mu: 10.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 36.0
+      igl_stiffness: 5.0
+    - crossfield_mu: 10.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 40.0
+      igl_stiffness: 5.0
+    - crossfield_mu: 20.0
+      poisson_depth: 7
+      use_igl_backend: true
+      igl_gradient_size: 72.0
+      igl_stiffness: 6.0
+    - crossfield_mu: 25.0
+      poisson_depth: 8
+      use_igl_backend: true
+      igl_gradient_size: 76.0
+      igl_stiffness: 7.0
+    - crossfield_mu: 20.0
+      poisson_depth: 7
+      use_igl_backend: true
+      igl_gradient_size: 60.0
+      igl_stiffness: 5.0
+    - crossfield_mu: 30.0
+      poisson_depth: 8
+      use_igl_backend: true
+      igl_gradient_size: 80.0
+      igl_stiffness: 8.0
+    - crossfield_mu: 35.0
+      poisson_depth: 9
+      use_igl_backend: true
+      igl_gradient_size: 80.0
+      igl_stiffness: 10.0

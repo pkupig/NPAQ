@@ -1,0 +1,127 @@
+model:
+  k: 20
+  emb_dims: 256
+  dropout: 0.5
+
+smoothing:
+  lambda: 0.1
+  k: 10
+
+features:
+  curvature_threshold: 0.2
+  cluster_eps: 0.05
+  min_cluster_size: 10
+  line_smoothing: 0.0
+  feature_vertex_threshold: 0.05
+
+miq:
+  poisson_depth: 6
+  crossfield_mu: 10.0
+  umbilic_smoothing: true
+  anisotropy_eps: 0.03
+  mu_min_ratio: 0.05
+  gradient_size: 1.0
+  seam_int_weight: 5.0
+  integer_constraints: true
+  require_closed_topology: false
+  anisotropy_schedule: [1.0, 0.7, 0.45, 0.25, 0.0]
+  integer_projection_iters: 2
+  integer_potential_iters: 2
+  max_param_dist: 0.7
+  use_igl_backend: true
+  igl_gradient_size: 20.0
+  igl_stiffness: 5.0
+  igl_direct_round: false
+  igl_miq_iter: 20
+
+pd:
+  mu: 0.1
+  iterations: 30
+  surface_attach_weight: 2.0
+  flip_backtracking: true
+  flip_backtrack_steps: 8
+  unroll_grad_iters: 5
+  anti_flip_weight: 10.0
+  anti_flip_eps: 1.0e-6
+  freeze_rounding_grad: true
+
+topology:
+  strict: true
+  selection_mode: balanced
+  allow_boundary: true
+  fill_boundary_quads: true
+  fill_boundary_quads_max_loop_len: 4
+  fill_boundary_quads_iters: 4
+  stitch_boundary_pairs: true
+  stitch_boundary_pairs_max_loop_len: 24
+  stitch_boundary_pairs_max_centroid_dist_ratio: 0.2
+  zipper_self_boundary_loops: true
+  zipper_self_boundary_loops_min_loop_len: 32
+  zipper_self_boundary_loops_min_gap_ratio: 0.05
+  zipper_self_boundary_loops_max_pair_dist_ratio: 0.15
+  zipper_self_boundary_loops_iters: 3
+  cap_even_boundary_loops: true
+  cap_even_boundary_loops_max_loop_len: 256
+  prune_boundary_fragments: true
+  prune_boundary_fragments_min_faces: 50
+  prune_boundary_fragments_min_ratio: 0.25
+  max_adaptive_profiles: 0
+  selection_dense_face_ratio: 0.8
+  selection_topology_override_face_ratio: 0.55
+  selection_topology_override_min_boundary_gain: 80
+  selection_topology_override_min_boundary_ratio: 0.2
+  selection_topology_quality_face_ratio: 0.4
+  selection_topology_max_cap_ratio: 0.2
+  selection_topology_max_repair_ratio: 0.3
+  selection_closed_dense_face_ratio: 0.9
+  selection_closed_topology_override_face_ratio: 0.75
+  selection_closed_topology_override_min_boundary_gain: 250
+  selection_closed_topology_override_min_boundary_ratio: 0.45
+  selection_closed_topology_quality_face_ratio: 0.6
+  selection_closed_topology_max_cap_ratio: 0.15
+  selection_closed_topology_max_repair_ratio: 0.28
+  export_topology_alternative: true
+  min_quads: 80
+  retry_profiles: []
+  closed_profile_overrides:
+    crossfield_mu: 10.0
+    poisson_depth: 6
+    use_igl_backend: true
+    igl_gradient_size: 20.0
+    igl_stiffness: 5.0
+  closed_retry_profiles:
+    - crossfield_mu: 15.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 28.0
+      igl_stiffness: 6.0
+    - crossfield_mu: 10.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 28.0
+      igl_stiffness: 5.0
+    - crossfield_mu: 15.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 32.0
+      igl_stiffness: 6.0
+    - crossfield_mu: 10.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 32.0
+      igl_stiffness: 5.0
+    - crossfield_mu: 15.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 36.0
+      igl_stiffness: 6.0
+    - crossfield_mu: 10.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 36.0
+      igl_stiffness: 5.0
+    - crossfield_mu: 10.0
+      poisson_depth: 6
+      use_igl_backend: true
+      igl_gradient_size: 40.0
+      igl_stiffness: 5.0
