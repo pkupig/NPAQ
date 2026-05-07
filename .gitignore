@@ -1,4 +1,5 @@
 /logs
+/logs_smoke
 /results
 /data
 /logs_base
@@ -8,6 +9,7 @@
 *.ply
 *.obj
 *.md
+!README.md
 *.txt
 /cpp_miq/build
 .polyscope.ini

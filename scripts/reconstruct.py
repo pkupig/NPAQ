@@ -64,6 +64,7 @@ from src.utils.topology_cert import (
     orient_quad_faces_consistently,
     prune_stacked_parallel_quads,
     prune_to_largest_boundary_light_component,
+    pair_triangles_to_quads_greedy,
     stitch_boundary_loop_pairs,
     triangulate_quads_for_reference_preview,
     zipper_self_matched_boundary_loops,
@@ -1539,6 +1540,64 @@ def _vertex_normals_from_tri_mesh(vertices: np.ndarray, faces: np.ndarray) -> np
     return N.astype(np.float32)
 
 
+def _orient_triangle_faces_consistently(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """
+    Make triangle winding locally consistent across shared edges, then apply
+    one global outward flip for closed components using signed volume.
+    """
+    V = np.asarray(vertices, dtype=np.float64)
+    F = np.asarray(faces, dtype=np.int64).copy()
+    if F.ndim != 2 or F.shape[1] != 3 or len(F) == 0:
+        return V.astype(np.float32), F, 0
+
+    from collections import defaultdict, deque
+    edge_to_faces = defaultdict(list)
+    for fi, tri in enumerate(F):
+        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+        for u, v in ((a, b), (b, c), (c, a)):
+            key = (u, v) if u < v else (v, u)
+            edge_to_faces[key].append((fi, u, v))
+
+    flip = np.zeros(len(F), dtype=bool)
+    seen = np.zeros(len(F), dtype=bool)
+
+    for seed in range(len(F)):
+        if seen[seed]:
+            continue
+        seen[seed] = True
+        dq = deque([seed])
+        while dq:
+            fi = dq.popleft()
+            tri = F[fi]
+            for u, v in ((int(tri[0]), int(tri[1])), (int(tri[1]), int(tri[2])), (int(tri[2]), int(tri[0]))):
+                key = (u, v) if u < v else (v, u)
+                for fj, eu, ev in edge_to_faces[key]:
+                    if fj == fi:
+                        continue
+                    same_dir = (u == eu and v == ev)
+                    need_flip = same_dir
+                    if not seen[fj]:
+                        flip[fj] = flip[fi] ^ need_flip
+                        seen[fj] = True
+                        dq.append(fj)
+
+    n_flipped_local = int(np.count_nonzero(flip))
+    if n_flipped_local > 0:
+        F[flip] = F[flip][:, [0, 2, 1]]
+
+    # For closed meshes, enforce dominant outward orientation globally.
+    v0, v1, v2 = V[F[:, 0]], V[F[:, 1]], V[F[:, 2]]
+    signed_vol = float(np.einsum('fi,fi->f', v0, np.cross(v1, v2)).sum())
+    if signed_vol < 0.0:
+        F = F[:, [0, 2, 1]]
+        return V.astype(np.float32), F.astype(np.int64), int(len(F))
+
+    return V.astype(np.float32), F.astype(np.int64), n_flipped_local
+
+
 def predict_metric_field(model, points, k_neighbors, device, normals=None):
     """
     Run the DGCNN on every point in the cloud and return per-point metrics.
@@ -1627,6 +1686,7 @@ def main():
         V_in = np.asarray(V_in, dtype=np.float32)
         F_in = np.asarray(F_in)
         if F_in.ndim == 2 and F_in.shape[1] == 3 and len(F_in) > 0:
+            V_in, F_in, n_face_flips = _orient_triangle_faces_consistently(V_in, F_in)
             points = V_in
             tri_mesh = (V_in, F_in)
             export_ref_points = V_in
@@ -1635,6 +1695,8 @@ def main():
             from src.utils.topology_cert import _boundary_loop_lengths
             expected_boundary_loops = len(_boundary_loop_lengths(F_in))
             print(f"  Triangle mesh detected: {len(V_in)} vertices, {len(F_in)} faces.")
+            if n_face_flips > 0:
+                print(f"  [input] reoriented {n_face_flips} triangle faces for consistent winding.")
         else:
             # No usable faces — treat as point cloud; also try to get normals
             points, input_normals = read_pointcloud_with_normals(args.input)
@@ -2744,6 +2806,7 @@ def main():
     if small_sharp_closed and selection_mode == 'quality':
         best_valid = _select_small_sharp_quality_candidate(valid_candidates, topo_cfg)
     best_fallback = _select_candidate(fallback_candidates, sel_cfg)
+    tri_pair_fallback_enabled = bool(topo_cfg.get('closed_triangle_pair_fallback', True))
 
     if best_valid is not None:
         _, _, quadV, quadF, topo_rep_init, topo_ok_init, best_qdiag, best_ai, _ = best_valid
@@ -2759,12 +2822,62 @@ def main():
                 f"with {len(quadF)} quads (strict=false)."
             )
         else:
-            details = "\n".join(attempt_reports)
-            raise RuntimeError(
-                "Failed to produce topology-valid initial quad mesh.\n"
-                f"Attempts:\n{details}\n"
-                "Tune topology.retry_profiles / miq parameters in the config."
+            # Closed-surface robustness fallback: geometry-only tri-pairing.
+            if closed_input and tri_mesh is not None and tri_pair_fallback_enabled:
+                fv, ff, fstats = pair_triangles_to_quads_greedy(tri_mesh[0], tri_mesh[1])
+                fok, frep = certify_quad_topology(
+                    fv, ff,
+                    allow_boundary=topo_allow_boundary,
+                    require_all_quads=True,
+                )
+                if len(ff) > 0 and (fok or not topo_strict):
+                    quadV, quadF = fv, ff
+                    topo_ok_init, topo_rep_init = fok, frep
+                    best_qdiag = None
+                    print(
+                        "  [topo] using closed-surface triangle-pair fallback: "
+                        f"quads={len(quadF)}, unmatched_tris={int(fstats.get('unmatched_triangles', 0))}"
+                    )
+                else:
+                    details = "\n".join(attempt_reports)
+                    raise RuntimeError(
+                        "Failed to produce topology-valid initial quad mesh.\n"
+                        f"Attempts:\n{details}\n"
+                        "Tune topology.retry_profiles / miq parameters in the config."
+                    )
+            else:
+                details = "\n".join(attempt_reports)
+                raise RuntimeError(
+                    "Failed to produce topology-valid initial quad mesh.\n"
+                    f"Attempts:\n{details}\n"
+                    "Tune topology.retry_profiles / miq parameters in the config."
+                )
+
+    # If closed-input output still has boundaries, try geometry-only tri-pairing
+    # and adopt it when topology quality improves.
+    if (
+        closed_input
+        and tri_mesh is not None
+        and tri_pair_fallback_enabled
+        and topo_rep_init is not None
+        and int(topo_rep_init.get('boundary_edges', 0)) > 0
+    ):
+        fv, ff, fstats = pair_triangles_to_quads_greedy(tri_mesh[0], tri_mesh[1])
+        if len(ff) > 0:
+            fok, frep = certify_quad_topology(
+                fv, ff,
+                allow_boundary=topo_allow_boundary,
+                require_all_quads=True,
             )
+            if _topology_penalty(frep, expected_boundary_loops, None) < _topology_penalty(topo_rep_init, expected_boundary_loops, None):
+                quadV, quadF = fv, ff
+                topo_ok_init, topo_rep_init = fok, frep
+                best_qdiag = None
+                print(
+                    "  [topo] replaced initial mesh with closed-surface triangle-pair fallback: "
+                    f"quads={len(quadF)}, unmatched_tris={int(fstats.get('unmatched_triangles', 0))}, "
+                    f"boundary_edges={int(topo_rep_init.get('boundary_edges', 0))}"
+                )
 
     print(f"  Initial mesh: {len(quadV)} vertices, {len(quadF)} quads.")
 

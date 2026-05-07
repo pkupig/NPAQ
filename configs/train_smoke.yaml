@@ -1,0 +1,43 @@
+data:
+  type: synthetic
+  k_neighbors: 16
+  noise_std: 0.001
+  cache: false
+  synthetic_train_points: 256
+  synthetic_val_points: 64
+  proportions:
+    cylinder: 0.25
+    torus: 0.25
+    saddle: 0.25
+    sphere: 0.25
+
+model:
+  k: 16
+  emb_dims: 128
+  dropout: 0.2
+  in_dims: 6
+  max_log_half: 1.5
+  predict_confidence: true
+
+loss:
+  lambda_aniso: 0.1
+  lambda_conf: 0.1
+  lambda_topo: 0.01
+  lambda_j: 0.0
+  topo_det_eps: 1.0e-3
+  topo_cond_max: 50.0
+
+training:
+  batch_size: 16
+  epochs: 1
+  lr: 0.0003
+  weight_decay: 1.0e-5
+  lr_scheduler: step
+  lr_decay_gamma: 0.5
+  lr_decay_step: 10
+  num_workers: 0
+  mixed_precision: false
+  checkpoint_dir: ./checkpoints
+  select_by: val_loss
+  early_stop_patience: 0
+  early_stop_min_delta: 1.0e-4

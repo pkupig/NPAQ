@@ -259,6 +259,154 @@ def align_triangle_faces_to_reference_normals(
     return V.copy(), F.copy(), int(np.count_nonzero(flip_mask))
 
 
+def pair_triangles_to_quads_greedy(
+    vertices: np.ndarray,
+    tri_faces: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Geometry-only fallback: pair adjacent triangles into quads via greedy dual matching.
+
+    This is field-independent and intended as a robustness fallback when
+    field-aligned extraction fails on difficult topologies.
+    """
+    V = np.asarray(vertices, dtype=np.float64)
+    T = np.asarray(tri_faces, dtype=np.int64)
+    stats = {
+        'num_triangles': int(T.shape[0]) if T.ndim == 2 else 0,
+        'num_pairs': 0,
+        'unmatched_triangles': 0,
+    }
+    if T.ndim != 2 or T.shape[1] != 3 or T.shape[0] == 0:
+        return V.copy(), np.zeros((0, 4), dtype=np.int64), stats
+
+    edge_to_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for fi, tri in enumerate(T):
+        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+        for u, v in ((a, b), (b, c), (c, a)):
+            e = (u, v) if u < v else (v, u)
+            edge_to_faces[e].append(fi)
+
+    face_to_candidates: dict[int, list[tuple[float, int, np.ndarray]]] = defaultdict(list)
+
+    def _quad_from_pair(t1: np.ndarray, t2: np.ndarray) -> np.ndarray | None:
+        edges = []
+        for tri in (t1, t2):
+            a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+            edges.extend([(a, b), (b, c), (c, a)])
+        undirected = Counter((u, v) if u < v else (v, u) for (u, v) in edges)
+        boundary = [e for e, cnt in undirected.items() if cnt == 1]
+        if len(boundary) != 4:
+            return None
+
+        adj: dict[int, list[int]] = defaultdict(list)
+        for u, v in boundary:
+            adj[u].append(v)
+            adj[v].append(u)
+        verts = [k for k in adj.keys() if len(adj[k]) == 2]
+        if len(verts) != 4:
+            return None
+
+        start = min(verts)
+        n0, n1 = adj[start][0], adj[start][1]
+        nxt = min(n0, n1)
+        order = [start, nxt]
+        prev, cur = start, nxt
+        while len(order) < 4:
+            nei = adj[cur]
+            cand = nei[0] if nei[0] != prev else nei[1]
+            if cand in order:
+                return None
+            order.append(cand)
+            prev, cur = cur, cand
+        if order[0] not in adj[order[-1]]:
+            return None
+        return np.asarray(order, dtype=np.int64)
+
+    def _pair_score(fa: int, fb: int, q: np.ndarray) -> float:
+        tri_a = T[fa]
+        tri_b = T[fb]
+        va0, va1, va2 = V[tri_a[0]], V[tri_a[1]], V[tri_a[2]]
+        vb0, vb1, vb2 = V[tri_b[0]], V[tri_b[1]], V[tri_b[2]]
+        na = np.cross(va1 - va0, va2 - va0)
+        nb = np.cross(vb1 - vb0, vb2 - vb0)
+        na_n = np.linalg.norm(na) + 1e-12
+        nb_n = np.linalg.norm(nb) + 1e-12
+        cos_d = float(np.dot(na, nb) / (na_n * nb_n))
+        vq = V[q]
+        d1 = vq[2] - vq[0]
+        d2 = vq[3] - vq[1]
+        qn = np.cross(d1, d2)
+        qn_n = np.linalg.norm(qn) + 1e-12
+        qn_u = qn / qn_n
+        planarity = np.abs(np.dot(vq[1] - vq[0], qn_u)) + np.abs(np.dot(vq[3] - vq[2], qn_u))
+        e = np.array([
+            np.linalg.norm(vq[1] - vq[0]),
+            np.linalg.norm(vq[2] - vq[1]),
+            np.linalg.norm(vq[3] - vq[2]),
+            np.linalg.norm(vq[0] - vq[3]),
+        ])
+        aspect_pen = float((e.max() + 1e-12) / (e.min() + 1e-12))
+        return cos_d - 0.02 * planarity - 0.01 * (aspect_pen - 1.0)
+
+    for e, faces in edge_to_faces.items():
+        if len(faces) != 2:
+            continue
+        fa, fb = int(faces[0]), int(faces[1])
+        q = _quad_from_pair(T[fa], T[fb])
+        if q is None:
+            continue
+        # Orient quad consistently with mean triangle normal.
+        vq = V[q]
+        qn = np.cross(vq[2] - vq[0], vq[3] - vq[1])
+        tna = np.cross(V[T[fa, 1]] - V[T[fa, 0]], V[T[fa, 2]] - V[T[fa, 0]])
+        tnb = np.cross(V[T[fb, 1]] - V[T[fb, 0]], V[T[fb, 2]] - V[T[fb, 0]])
+        tn = tna + tnb
+        if float(np.dot(qn, tn)) < 0.0:
+            q = q[[0, 3, 2, 1]]
+        s = _pair_score(fa, fb, q)
+        face_to_candidates[fa].append((s, fb, q))
+        face_to_candidates[fb].append((s, fa, q))
+
+    pairs: list[tuple[float, int, int, np.ndarray]] = []
+    seen_pair = set()
+    for fa, cands in face_to_candidates.items():
+        for s, fb, q in cands:
+            a, b = (fa, fb) if fa < fb else (fb, fa)
+            if (a, b) in seen_pair:
+                continue
+            seen_pair.add((a, b))
+            pairs.append((s, a, b, q))
+    pairs.sort(key=lambda x: x[0], reverse=True)
+
+    used = np.zeros(T.shape[0], dtype=bool)
+    quads: list[np.ndarray] = []
+    for _, fa, fb, q in pairs:
+        if used[fa] or used[fb]:
+            continue
+        used[fa] = True
+        used[fb] = True
+        quads.append(q)
+
+    # Second pass: try to pair any remaining triangles with first available neighbour.
+    if np.any(~used):
+        for fa in np.where(~used)[0].tolist():
+            if used[fa]:
+                continue
+            cands = sorted(face_to_candidates.get(fa, []), key=lambda x: x[0], reverse=True)
+            for _, fb, q in cands:
+                if used[fb]:
+                    continue
+                used[fa] = True
+                used[fb] = True
+                quads.append(q)
+                break
+
+    Q = np.asarray(quads, dtype=np.int64) if quads else np.zeros((0, 4), dtype=np.int64)
+    stats['num_pairs'] = int(Q.shape[0])
+    stats['unmatched_triangles'] = int(np.count_nonzero(~used))
+    return V.copy(), Q, stats
+
+
 def prune_stacked_parallel_quads(
     vertices: np.ndarray,
     faces: np.ndarray,

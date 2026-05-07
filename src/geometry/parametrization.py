@@ -464,10 +464,10 @@ def extract_quads_integer_grid(
         raise RuntimeError(
             "Integer-grid quad extraction produced zero valid quads.\n"
             "Possible causes:\n"
-            "  • gradient_size is too large (too few integer cells)\n"
-            "  • cross-field is degenerate (all vertices map to same integer cell)\n"
-            "  • one-to-one manifold extraction filtered all candidates\n"
-            "  • mesh is too coarse relative to gradient_size\n"
+            "  - gradient_size is too large (too few integer cells)\n"
+            "  - cross-field is degenerate (all vertices map to same integer cell)\n"
+            "  - one-to-one manifold extraction filtered all candidates\n"
+            "  - mesh is too coarse relative to gradient_size\n"
             "Adjust miq.gradient_size or miq.crossfield_mu in the config."
         )
 

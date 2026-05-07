@@ -1,0 +1,68 @@
+model:
+  k: 20
+  emb_dims: 256
+  dropout: 0.5
+
+smoothing:
+  lambda: 0.05
+  k: 10
+
+features:
+  curvature_threshold: 10.0
+  cluster_eps: 0.05
+  min_cluster_size: 999999
+  line_smoothing: false
+  mesh_include_boundary: false
+
+miq:
+  poisson_depth: 5
+  crossfield_mu: 1.0
+  umbilic_smoothing: true
+  anisotropy_eps: 0.005
+  mu_min_ratio: 0.02
+  gradient_size: 0.15
+  integer_constraints: true
+  require_closed_topology: false
+  anisotropy_schedule: [0.0]
+  integer_projection_iters: 1
+  integer_potential_iters: 1
+  max_param_dist: 0.9
+  use_igl_backend: false
+  adaptive_increase_poisson_depth: false
+
+pd:
+  mu: 0.1
+  iterations: 4
+  surface_attach_weight: 1.0
+  flip_backtracking: true
+  flip_backtrack_steps: 4
+  anti_flip_weight: 10.0
+  anti_flip_eps: 1.0e-6
+
+topology:
+  strict: false
+  selection_mode: balanced
+  allow_boundary: true
+  min_quads: 1
+  max_adaptive_profiles: 1
+  closed_max_retry_profiles: 4
+  closed_retry_profiles:
+    - gradient_size: 0.10
+      crossfield_mu: 3.0
+      anisotropy_schedule: [0.0]
+    - gradient_size: 0.06
+      crossfield_mu: 8.0
+      anisotropy_schedule: [0.0]
+    - gradient_size: 0.04
+      crossfield_mu: 12.0
+      anisotropy_schedule: [0.0]
+  remesh_boundary_with_miq: false
+  prune_boundary_fragments: false
+  fill_boundary_quads: false
+  stitch_boundary_pairs: false
+  zipper_self_boundary_loops: false
+  post_pd_planarize: false
+  post_pd_shape_polish: false
+  post_pd_cleanup: false
+  export_topology_alternative: false
+  export_triangle_preview: false

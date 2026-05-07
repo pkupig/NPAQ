@@ -221,6 +221,7 @@ def build_connection_laplacian(
 def guidance_field_from_metric(
     M_vert: np.ndarray,
     frames: np.ndarray,
+    isotropy_eps: float = 1e-6,
 ) -> np.ndarray:
     """
     Compute guidance u* = exp(4i θ*) from the per-vertex 2×2 metric tensors.
@@ -239,7 +240,19 @@ def guidance_field_from_metric(
     # Largest eigenvalue → last column
     d1 = eigvecs[:, :, -1]   # (N, 2)  principal direction in 2D LCF
     theta = np.arctan2(d1[:, 1], d1[:, 0])      # (N,)
-    return np.exp(4j * theta).astype(np.complex64)
+    u_star = np.exp(4j * theta).astype(np.complex64)
+
+    # Near-isotropic tensors have undefined principal direction: eigh may return
+    # numerically arbitrary eigenvectors that inject random guidance phases.
+    # Clamp such vertices to neutral guidance (theta=0 -> u*=1) to avoid
+    # artificial symmetry breaking on near-isotropic regions (e.g. torus tests).
+    if float(isotropy_eps) > 0.0:
+        aniso = anisotropy_degree_from_metric(M_vert)
+        iso_mask = aniso <= float(isotropy_eps)
+        if np.any(iso_mask):
+            u_star = np.asarray(u_star, dtype=np.complex64).copy()
+            u_star[iso_mask] = np.complex64(1.0 + 0.0j)
+    return u_star
 
 
 def anisotropy_degree_from_metric(M_vert: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -780,7 +793,12 @@ def solve_crossfield_gl(
     N = len(V)
 
     L_real, L_imag = build_connection_laplacian(V, F, frames)
-    u_star = guidance_field_from_metric(M_vert, frames)
+    # Use a small isotropy threshold so numerically isotropic tensors do not
+    # introduce arbitrary principal directions via unstable eigenvectors.
+    u_star = guidance_field_from_metric(
+        M_vert, frames,
+        isotropy_eps=max(1e-6, float(anisotropy_eps) * 0.25),
+    )
 
     # Umbilic-aware guidance:
     # principal directions are unstable where anisotropy≈0, so use harmonic
@@ -877,7 +895,14 @@ def solve_crossfield_gl(
             0.8 * singularity_override_weight[singularity_active],
         )
         anchor_mask = np.asarray(anchor_mask | singularity_active, dtype=bool)
-    if umbilic_smoothing:
+    # Fully isotropic case: there is no trustworthy directional anchor anywhere.
+    # Falling back to raw eigenvector guidance would inject random phases.
+    # Use a neutral constant guidance field and keep reliability at zero.
+    if not np.any(anchor_mask):
+        u_star = np.ones(N, dtype=np.complex64)
+        reliability = np.zeros(N, dtype=np.float64)
+
+    if umbilic_smoothing and np.any(anchor_mask):
         W = compute_cotangent_weights(V, F)
         u_star = _harmonic_fill_complex(W, u_star, anchor_mask)
 
