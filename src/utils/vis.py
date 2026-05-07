@@ -3,6 +3,13 @@ Visualization utilities using polyscope and matplotlib.
 Supports rendering of point clouds, meshes, metric fields (as ellipses), and feature lines.
 """
 
+import os
+
+# Some headless/WSL environments have a non-writable ~/.config/matplotlib.
+# Set a writable default before importing pyplot; respect user overrides.
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
+
 import numpy as np
 try:
     import polyscope as ps

@@ -1,52 +1,44 @@
 data:
   type: abc
-  # Root directory that abc_preprocess.py writes into.
-  # Expected structure:
-  #   data/abc_preprocessed/train/*.npz   (from chunk 0000)
-  #   data/abc_preprocessed/val/*.npz     (from chunk 0001)
+  # Expected layout (from scripts/abc_preprocess.py):
+  #   data/abc_preprocessed/train/*.npz
+  #   data/abc_preprocessed/val/*.npz
   # Create with:
   #   python scripts/download_abc.py --chunks 0 1 --output data/abc --preprocess
   root_dir: data/abc_preprocessed
   k_neighbors: 32
-  consistency_queries: 6
-  consistency_radius_ratio: 0.18
-  noise_std: 0.005   # lighter noise than synthetic: real CAD has less measurement error
-  cache: false
-  use_normal: true   # ABCDataset uses normals to build LCF (Duff et al. frame)
+  noise_std: 0.005
+  # cache=true caches all .npz files + KDTrees in RAM up-front. Required for
+  # acceptable training speed: with cache=false, each __getitem__ would re-
+  # decode the .npz and rebuild a 100k-point KDTree (the dominant DataLoader
+  # cost on preprocessed datasets). For ABC's many small files this is ~1 GB.
+  cache: true
+  use_normal: true
 
 model:
   k: 20
   emb_dims: 256
-  dropout: 0.2   # was 0.5; reduced to close the train/val gap and get readable loss curves
+  dropout: 0.2
+  in_dims: 6
   max_log_half: 1.5
   predict_confidence: true
-  predict_singularity: false
 
 loss:
-  lambda_dir:  0.1   # §3.5 — directional alignment (principal direction)
-  dir_stop_threshold: 0.05
-  lambda_sing: 0.0   # no singularity labels in ABC .npz files
-  lambda_ph:   0.0   # Poincaré–Hopf constraint inactive without sing_labels
-  lambda_j:    0.0   # Jacobian end-to-end loss: enable once metric head converges
-  lambda_conf: 0.1   # confidence supervision (anisotropy reliability)
-  lambda_topo: 0.01
-  topo_det_eps: 1.0e-3
+  lambda_aniso: 0.1
+  lambda_conf:  0.1   # directional-saliency supervision (legacy field name: confidence)
+  lambda_topo:  0.01
+  lambda_j:     0.0   # optional unrolled PD loss; current train.py fails fast if >0
+  topo_det_eps:  1.0e-3
   topo_cond_max: 50.0
-  topo_entropy_weight: 0.1
-  topo_field_weight: 0.4
-  topo_ring_weight: 0.2
-  topo_cons_metric_weight: 0.6
-  topo_cons_dir_weight: 0.3
-  topo_consistency_sigma: 0.3
-  topo_ring_min_queries: 6
 
 training:
   batch_size: 64
   epochs: 100
   lr: 0.0003
   weight_decay: 1.0e-5
+  lr_scheduler: step
   lr_decay_step: 20
   lr_decay_gamma: 0.5
-  num_workers: 0      # WSL2 multiprocessing instability — keep at 0
+  num_workers: 0
   mixed_precision: false
   checkpoint_dir: ./checkpoints_abc

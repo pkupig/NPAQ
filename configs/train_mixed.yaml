@@ -1,0 +1,57 @@
+data:
+  type: mixed
+  real_ratio: 0.3            # 30% Stanford real meshes, 70% synthetic
+
+  # ── Synthetic part (extended coverage) ──
+  proportions:
+    cylinder:      0.10
+    torus:         0.10
+    saddle:        0.10
+    ellipsoid:     0.10
+    box:           0.10
+    plane:         0.10
+    gaussian_bump: 0.15
+    monge_patch:   0.25
+  synthetic_train_points: 25000
+  synthetic_val_points:   3000
+
+  # ── Real (Stanford) part ──
+  # Preprocess first:
+  #   python scripts/preprocess_stanford.py \
+  #       --input  /mnt/e/Users/DELL/Desktop/stanford_data \
+  #       --output data/stanford_preprocessed
+  real_root_dir: data/stanford_preprocessed
+  use_normal: true
+
+  # ── Shared ──
+  k_neighbors: 32
+  noise_std: 0.003
+  cache: false
+
+model:
+  k: 20
+  emb_dims: 256
+  dropout: 0.2
+  in_dims: 6
+  max_log_half: 1.5
+  predict_confidence: true
+
+loss:
+  lambda_aniso: 0.1
+  lambda_conf:  0.1   # directional-saliency supervision (legacy field name: confidence)
+  lambda_topo:  0.01
+  lambda_j:     0.0   # optional unrolled PD loss; current train.py fails fast if >0
+  topo_det_eps:  1.0e-3
+  topo_cond_max: 50.0
+
+training:
+  batch_size: 64
+  epochs: 200
+  lr: 0.0003
+  weight_decay: 1.0e-5
+  lr_scheduler: step
+  lr_decay_step: 40
+  lr_decay_gamma: 0.5
+  num_workers: 2             # WSL2 fork; drop to 0 if OOM/deadlock
+  mixed_precision: false
+  checkpoint_dir: ./checkpoints_mixed

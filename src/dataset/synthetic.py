@@ -1,19 +1,13 @@
 from .base import BaseDataset
-from .synthesis import SURFACES, sample_surface
+from .synthesis import SURFACES
 import numpy as np
 import torch
 
 class SyntheticDataset(BaseDataset):
     """Generate synthetic patches on-the-fly from analytic surfaces."""
     def __init__(self, proportions=None, points_per_epoch=10000, k_neighbors=32,
-                 noise_std=0.0, transform=None, cache=False,
-                 consistency_queries: int = 0,
-                 consistency_radius_ratio: float = 0.2):
-        super().__init__(
-            k_neighbors, transform, noise_std, cache,
-            consistency_queries=consistency_queries,
-            consistency_radius_ratio=consistency_radius_ratio,
-        )
+                 noise_std=0.0, transform=None, cache=False):
+        super().__init__(k_neighbors, transform, noise_std, cache)
         self.proportions = proportions or {'cylinder':0.4, 'torus':0.4, 'saddle':0.2}
         self.points_per_epoch = points_per_epoch
         self.specs = {name: SURFACES[name] for name in self.proportions}
@@ -24,76 +18,79 @@ class SyntheticDataset(BaseDataset):
         return self.points_per_epoch
 
     def __getitem__(self, idx):
+        from .lcf import compute_local_canonical_frame
+        from scipy.spatial import KDTree
+
         # Choose surface
         names = list(self.proportions.keys())
         probs = list(self.proportions.values())
         surf_name = self.rng.choice(names, p=probs)
         spec = self.specs[surf_name]
 
-        # Generate a small patch of points (more than k to allow neighbor selection)
-        n_patch = self.k_neighbors * 5
-        points, metrics, dir1, dir2, normals, params = sample_surface(
-            spec, n_patch, noise_std=self.noise_std, seed=self.rng.randint(1e6)
-        )
+        u_lo, u_hi = spec.u_range
+        v_lo, v_hi = spec.v_range
 
-        # Random query (avoid boundary points that have fewer real neighbors)
-        query_idx = self.rng.randint(n_patch)
+        # ── Step 1: pick query params from interior ──────────────────────────
+        # Margin only on non-periodic dimensions (periodic dims have no real boundary).
+        u_margin = 0.0 if spec.periodic_u else spec.query_margin_frac * (u_hi - u_lo)
+        v_margin = 0.0 if spec.periodic_v else spec.query_margin_frac * (v_hi - v_lo)
+        u0 = self.rng.uniform(u_lo + u_margin, u_hi - u_margin)
+        v0 = self.rng.uniform(v_lo + v_margin, v_hi - v_margin)
 
-        # Compute LCF for the query point using the full patch as context.
-        # When analytic normals are available, pass them so:
-        #   (a) the LCF z-axis is the exact surface normal (not noisy PCA estimate)
-        #   (b) neighbor normals (rotated into LCF) are returned as extra features.
-        from .lcf import compute_local_canonical_frame
-        from scipy.spatial import KDTree
+        # ── Step 2: sample context points from LOCAL parameter window ────────
+        # Drawing context from [u0 ± patch_half_u] × [v0 ± patch_half_v] ensures
+        # all sampled points are geodesically close to the query, so Euclidean
+        # k-NN neighbours are not contaminated by "back of the cylinder" points
+        # that are 3D-close but geodesically distant.
+        n_context = self.k_neighbors * 5 - 1
+        du = self.rng.uniform(-spec.patch_half_u, spec.patch_half_u, n_context)
+        dv = self.rng.uniform(-spec.patch_half_v, spec.patch_half_v, n_context)
+        u_ctx = u0 + du
+        v_ctx = v0 + dv
+
+        # Wrap periodic dimensions; clamp non-periodic to domain bounds.
+        if spec.periodic_u:
+            period_u = u_hi - u_lo
+            u_ctx = (u_ctx - u_lo) % period_u + u_lo
+        else:
+            u_ctx = np.clip(u_ctx, u_lo, u_hi)
+        if spec.periodic_v:
+            period_v = v_hi - v_lo
+            v_ctx = (v_ctx - v_lo) % period_v + v_lo
+        else:
+            v_ctx = np.clip(v_ctx, v_lo, v_hi)
+
+        # Prepend the exact query point as index 0.
+        u_all = np.concatenate([[u0], u_ctx])
+        v_all = np.concatenate([[v0], v_ctx])
+        query_idx = 0
+
+        # ── Step 3: evaluate analytic surface properties ─────────────────────
+        # Per-sample random params (e.g. monge coefficients, bump amplitude).
+        params = spec.param_sampler(self.rng) if spec.param_sampler is not None else {}
+        points = spec.func(u_all, v_all, **params)                                  # (N, 3)
+        normals = spec.normals_fn(u_all, v_all, **params) if spec.normals_fn is not None else None
+        if self.noise_std > 0:
+            points = points + self.rng.normal(0, self.noise_std, points.shape)
+        metrics_all = spec.metric_tensor(u_all, v_all, **params)                    # (N, 3, 3)
+
+        # ── Step 4: LCF + 2D metric projection ───────────────────────────────
         tree = KDTree(points)
         local_coords, basis, neighbor_normals = compute_local_canonical_frame(
             points, query_idx, k=self.k_neighbors, normals=normals, tree=tree
         )
 
-        target_metric = metrics[query_idx]
-        target_dir1 = dir1[query_idx]
-        target_dir2 = dir2[query_idx]
+        R = basis[:, :2]                              # (3, 2)
+        target_metric = R.T @ metrics_all[0] @ R     # (2, 2)
 
-        # Concatenate position + normal → (K, 6) input features.
-        # neighbor_normals encodes curvature via normal variation across the patch,
-        # making principal curvature direction and magnitude directly observable.
         if neighbor_normals is not None:
-            points_feat = np.concatenate([local_coords, neighbor_normals], axis=-1)  # (K, 6)
+            points_feat = np.concatenate([local_coords, neighbor_normals], axis=-1)
         else:
-            points_feat = local_coords  # (K, 3) fallback
+            points_feat = local_coords
 
-        out = {
+        return {
             'points': torch.from_numpy(points_feat).float(),
             'metric': torch.from_numpy(target_metric).float(),
-            'principal_dir1': torch.from_numpy(target_dir1).float(),
-            'principal_dir2': torch.from_numpy(target_dir2).float(),
-            'basis': torch.from_numpy(basis).float(),
+            'basis':  torch.from_numpy(basis).float(),
             'query_idx': query_idx,
         }
-        extra_idx = self._select_consistency_query_indices(points, query_idx, tree=tree)
-        if len(extra_idx) > 0:
-            extra_points = []
-            extra_metrics = []
-            extra_dir1 = []
-            extra_dir2 = []
-            extra_basis = []
-            extra_pos = []
-            for qi in extra_idx.tolist():
-                c_local, c_basis, c_normals = compute_local_canonical_frame(
-                    points, qi, k=self.k_neighbors, normals=normals, tree=tree
-                )
-                c_feat = np.concatenate([c_local, c_normals], axis=-1) if c_normals is not None else c_local
-                extra_points.append(c_feat.astype(np.float32))
-                extra_metrics.append(metrics[qi].astype(np.float32))
-                extra_dir1.append(dir1[qi].astype(np.float32))
-                extra_dir2.append(dir2[qi].astype(np.float32))
-                extra_basis.append(c_basis.astype(np.float32))
-                rel = (points[qi] - points[query_idx]) @ basis
-                extra_pos.append(rel.astype(np.float32))
-            out['consistency_points'] = torch.from_numpy(np.stack(extra_points, axis=0)).float()
-            out['consistency_metric'] = torch.from_numpy(np.stack(extra_metrics, axis=0)).float()
-            out['consistency_principal_dir1'] = torch.from_numpy(np.stack(extra_dir1, axis=0)).float()
-            out['consistency_principal_dir2'] = torch.from_numpy(np.stack(extra_dir2, axis=0)).float()
-            out['consistency_basis'] = torch.from_numpy(np.stack(extra_basis, axis=0)).float()
-            out['consistency_query_pos'] = torch.from_numpy(np.stack(extra_pos, axis=0)).float()
-        return out

@@ -6,7 +6,7 @@ Implements diffusion equation for smoothing metric tensors (Section 5.2).
 import numpy as np
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
-from sklearn.neighbors import KDTree
+from scipy.spatial import KDTree
 from typing import Optional
 
 
@@ -57,8 +57,10 @@ def build_point_cloud_laplacian(
     # twice (once from i's loop, once from j's loop), making A[i,j]=2 instead of 1.
     # Resetting data to 1.0 fixes this without changing sparsity pattern.
     A.data[:] = 1.0
-    # Set diagonal to zero (just in case)
+    # Set diagonal to zero via LIL to avoid SparseEfficiencyWarning
+    A = A.tolil()
     A.setdiag(0)
+    A = A.tocsr()
     A.eliminate_zeros()
 
     # Degree matrix
@@ -137,30 +139,50 @@ def smooth_metric_field_implicit(
     k: int = 10
 ) -> np.ndarray:
     """
-    Implicit smoothing: solve (I + lambda L) M_new = M.
-    This is more stable for large lambda.
+    Log-Euclidean implicit smoothing:
+
+        (I + lambda L^T L) log(M_new) = log(M)
+
+    Smoothing in the matrix-log domain keeps the result on the SPD manifold
+    after exponentiation, matching the theory in PAPER.md §4.
     """
     if laplacian is None:
         laplacian = build_point_cloud_laplacian(points, k=k)
 
     N = metric_field.shape[0]
     I = sparse.identity(N, format='csr')
-    A = I + lambda_smooth * laplacian
+    A = I + lambda_smooth * (laplacian.T @ laplacian)
 
-    components = np.zeros((N, 4))
-    components[:, 0] = metric_field[:, 0, 0]
-    components[:, 1] = metric_field[:, 0, 1]
-    components[:, 2] = metric_field[:, 1, 0]
-    components[:, 3] = metric_field[:, 1, 1]
+    M = np.asarray(metric_field, dtype=np.float64)
+    M = 0.5 * (M + np.swapaxes(M, -1, -2))
+    eigvals, eigvecs = np.linalg.eigh(M)
+    log_eig = np.log(np.clip(eigvals, 1e-8, None))
+    logM = eigvecs @ _diag_embed_np(log_eig) @ np.swapaxes(eigvecs, -1, -2)
+
+    components = np.zeros((N, 4), dtype=np.float64)
+    components[:, 0] = logM[:, 0, 0]
+    components[:, 1] = logM[:, 0, 1]
+    components[:, 2] = logM[:, 1, 0]
+    components[:, 3] = logM[:, 1, 1]
 
     smoothed_comp = np.zeros_like(components)
     for c in range(4):
         smoothed_comp[:, c] = spsolve(A, components[:, c])
 
-    smoothed = np.zeros_like(metric_field)
-    smoothed[:, 0, 0] = smoothed_comp[:, 0]
-    smoothed[:, 0, 1] = smoothed_comp[:, 1]
-    smoothed[:, 1, 0] = smoothed_comp[:, 2]
-    smoothed[:, 1, 1] = smoothed_comp[:, 3]
-    smoothed[:, 0, 1] = smoothed[:, 1, 0] = 0.5 * (smoothed[:, 0, 1] + smoothed[:, 1, 0])
-    return smoothed
+    logM_s = np.zeros((N, 2, 2), dtype=np.float64)
+    logM_s[:, 0, 0] = smoothed_comp[:, 0]
+    logM_s[:, 0, 1] = smoothed_comp[:, 1]
+    logM_s[:, 1, 0] = smoothed_comp[:, 2]
+    logM_s[:, 1, 1] = smoothed_comp[:, 3]
+    logM_s = 0.5 * (logM_s + np.swapaxes(logM_s, -1, -2))
+
+    eigvals_s, eigvecs_s = np.linalg.eigh(logM_s)
+    smoothed = eigvecs_s @ _diag_embed_np(np.exp(eigvals_s)) @ np.swapaxes(eigvecs_s, -1, -2)
+    return smoothed.astype(metric_field.dtype, copy=False)
+
+
+def _diag_embed_np(values: np.ndarray) -> np.ndarray:
+    out = np.zeros(values.shape + (values.shape[-1],), dtype=values.dtype)
+    idx = np.arange(values.shape[-1])
+    out[..., idx, idx] = values
+    return out

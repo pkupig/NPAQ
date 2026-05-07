@@ -3,9 +3,7 @@ Local Canonical Frame (LCF) construction for point clouds.
 Implements Section 5.1.2 of the paper.
 """
 
-import torch
 import numpy as np
-from sklearn.decomposition import PCA
 from typing import Tuple, Optional
 
 
@@ -48,20 +46,21 @@ def compute_local_canonical_frame(
     # Center the neighbors
     centered = neighbors - center  # (k, 3)
 
-    # Perform PCA on the centered neighbors
-    pca = PCA(n_components=3)
-    pca.fit(centered)
-    basis = pca.components_.T  # (3, 3), columns are eigenvectors in descending order
+    # PCA via direct 3x3 eigendecomposition of the covariance matrix.
+    # np.linalg.eigh avoids PCA object overhead and keeps DataLoader work small.
+    cov = centered.T @ centered                        # (3, 3)
+    eigvals, eigvecs = np.linalg.eigh(cov)             # ascending
+    # Descending order, columns are components.
+    basis = eigvecs[:, ::-1]                           # (3, 3)
 
     # ── Sign disambiguation ────────────────────────────────────────────────────
-    # sklearn PCA eigenvectors have an arbitrary sign (v and -v are equally valid).
+    # PCA eigenvectors have an arbitrary sign (v and -v are equally valid).
     # Without disambiguation, the same patch processed twice can yield (e1, e2) or
     # (-e1, e2), flipping the off-diagonal terms of the 2D projected metric tensor
     # and corrupting the predicted principal direction angle θ*.
     #
     # Convention: each eigenvector's largest-magnitude component must be positive.
-    # This is the standard "max-abs" sign convention, identical across all sklearn
-    # versions and platforms.
+    # This is the standard "max-abs" sign convention.
     for i in range(3):
         col = basis[:, i]
         max_idx = np.argmax(np.abs(col))
@@ -74,8 +73,8 @@ def compute_local_canonical_frame(
         basis[:, 2] = -basis[:, 2]
 
     # If normals are provided, align the z-axis with the normal of the query point.
-    # Build e1/e2 with the Duff et al. (2017) smooth formula — same as
-    # compute_vertex_frames — so training (ABC) and inference share the same frame.
+    # Build e1/e2 with Duff et al.'s numerically stable ONB formula — same as
+    # compute_vertex_frames — so training and inference share the same frame.
     if normals is not None:
         normal_query = normals[query_idx]  # (3,)
         e3_new = normal_query / (np.linalg.norm(normal_query) + 1e-12)
@@ -89,6 +88,16 @@ def compute_local_canonical_frame(
         e2_new /= np.linalg.norm(e2_new) + 1e-12
         basis = np.stack([e1_new, e2_new, e3_new], axis=1)
 
+    # ── X-Y axis sign disambiguation via 3rd-order moment (skewness) ──────────
+    # After PCA (or Duff ONB), e1 and e2 can still flip 180°.
+    # Force e1 to point toward the denser half of the local neighborhood by
+    # requiring the skewness (3rd moment) of projected X-coordinates to be positive.
+    # This makes the frame consistent across identical patches processed separately.
+    coords_tmp = centered @ basis   # (k, 3) temporary projection
+    if np.sum(coords_tmp[:, 0] ** 3) < 0:
+        basis[:, 0] = -basis[:, 0]
+        basis[:, 1] = -basis[:, 1]  # flip both to keep right-handed frame
+
     # Transform neighbors to LCF: coordinates in the basis
     local_coords = centered @ basis  # (k, 3)   (x,y,z) in local frame
 
@@ -101,30 +110,3 @@ def compute_local_canonical_frame(
         return local_coords, basis, neighbor_normals, indices
     else:
         return local_coords, basis, neighbor_normals
-
-
-def build_lcf_batch(
-    points: torch.Tensor,
-    query_indices: torch.Tensor,
-    k: int = 32,
-    normals: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """
-    Batch version of compute_local_canonical_frame using PyTorch operations.
-    This is more suitable for GPU acceleration during training.
-
-    Args:
-        points: (N, 3) tensor of point coordinates.
-        query_indices: (B,) tensor of query point indices.
-        k: Number of nearest neighbors.
-        normals: (N, 3) tensor of normals (optional).
-
-    Returns:
-        local_coords_batch: (B, k, 3) tensor of neighbor coordinates in LCF.
-        basis_batch: (B, 3, 3) orthonormal basis matrices.
-        neighbor_normals_batch: (B, k, 3) tensor of neighbor normals in LCF (if normals provided).
-    """
-    # This implementation uses torch's k-NN (could use torch-cluster or faiss)
-    # For simplicity, we assume a function `knn` that returns indices.
-    # Here we provide a placeholder; actual implementation may use `torch.cdist` or third-party libs.
-    raise NotImplementedError("Batch LCF requires efficient GPU k-NN. Consider using torch-cluster or custom CUDA.")

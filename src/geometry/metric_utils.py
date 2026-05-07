@@ -28,36 +28,36 @@ def params_to_tensor(
     """
     # Determine input type and device
     if isinstance(s1, torch.Tensor):
-        # Half-angle formulas from (c, s) = (cos 2θ, sin 2θ):
-        #   cosθ =        sqrt((1 + c) / 2)
-        #   sinθ = sign(s)*sqrt((1 - c) / 2)
-        #
-        # Division-free and stable for all c ∈ [-1, 1].
-        # The model can output c outside [-1, 1] early in training; clamp first
-        # so the sqrt arguments are always non-negative (avoids NaN → eigh crash).
-        c_safe = c.clamp(-1.0, 1.0)
-        cosθ = torch.sqrt((1.0 + c_safe) / 2.0 + 1e-8)
-        sinθ = torch.sign(s) * torch.sqrt((1.0 - c_safe) / 2.0 + 1e-8)
+        # Use atan2 rather than sign-based half-angle recovery.  The sqrt/sign
+        # formula is ambiguous at (c, s)=(-1, 0) and can collapse a valid 90 deg
+        # direction into a near-zero rotation.
+        theta = 0.5 * torch.atan2(s, c)
+        cosθ = torch.cos(theta)
+        sinθ = torch.sin(theta)
         R = torch.stack([torch.stack([cosθ, -sinθ], dim=-1),
                          torch.stack([sinθ,  cosθ], dim=-1)], dim=-2)  # (..., 2, 2)
-        # Sort eigenvalues descending so that s1² ≥ s2² always.
-        # This makes the parameterisation consistent with tensor_to_params (which
-        # assigns s1=sqrt(λ_max)) and removes a symmetry saddle point in the loss.
-        ev = torch.stack([s1**2, s2**2], dim=-1)
-        ev, _ = ev.sort(dim=-1, descending=True)   # s1² ≥ s2²
-        ev = ev.clamp(1e-4, 1e4)
-        diag = torch.diag_embed(ev)                                      # (..., 2, 2)
+        # DGCNN's softplus parameterisation guarantees s1 ≥ s2; no sort needed.
+        ev = torch.stack([s1**2, s2**2], dim=-1).clamp(1e-4, 1e4)
+        diag = torch.diag_embed(ev)
         M = R @ diag @ R.transpose(-2, -1)
         return M
     else:
-        # numpy version — same stable half-angle formula
-        c_safe = float(np.clip(c, -1.0, 1.0))
-        cosθ = np.sqrt((1.0 + c_safe) / 2.0 + 1e-8)
-        sinθ = np.sign(s) * np.sqrt((1.0 - c_safe) / 2.0 + 1e-8)
-        R = np.array([[cosθ, -sinθ], [sinθ, cosθ]])  # (2,2)
-        ev = np.clip(np.array([s1**2, s2**2]), 1e-4, 1e4)
-        diag = np.diag(ev)
-        M = R @ diag @ R.T
+        theta = 0.5 * np.arctan2(s, c)
+        cosθ = np.cos(theta)
+        sinθ = np.sin(theta)
+        R = np.stack([
+            np.stack([cosθ, -sinθ], axis=-1),
+            np.stack([sinθ,  cosθ], axis=-1),
+        ], axis=-2)
+        ev = np.clip(
+            np.stack([np.asarray(s1) ** 2, np.asarray(s2) ** 2], axis=-1),
+            1e-4,
+            1e4,
+        )
+        diag = np.zeros(np.shape(ev)[:-1] + (2, 2), dtype=np.asarray(ev).dtype)
+        diag[..., 0, 0] = ev[..., 0]
+        diag[..., 1, 1] = ev[..., 1]
+        M = R @ diag @ np.swapaxes(R, -1, -2)
         return M
 
 
@@ -218,8 +218,5 @@ def metric_to_ellipse(M: Union[np.ndarray, torch.Tensor]):
     # MAIE semi-axes equal the singular values of J: σ_max=1/s2 (longer), σ_min=1/s1 (shorter).
     a = 1.0 / s2  # larger semi-axis
     b = 1.0 / s1  # smaller semi-axis
-    # Orientation angle θ from (c,s)
-    cosθ = np.sqrt((1 + c) / 2)
-    sinθ = s / (2 * cosθ)
-    angle = np.arctan2(sinθ, cosθ)
+    angle = 0.5 * np.arctan2(s, c)
     return a, b, angle

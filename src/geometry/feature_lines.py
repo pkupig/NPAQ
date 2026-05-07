@@ -4,9 +4,7 @@ Implements Section 5.5.1 with robust methods.
 """
 
 import numpy as np
-from sklearn.neighbors import KDTree
-from sklearn.cluster import DBSCAN
-from sklearn.decomposition import PCA
+from scipy.spatial import KDTree
 from typing import List, Optional, Tuple, Union
 import warnings
 from collections import defaultdict
@@ -16,7 +14,7 @@ def estimate_normals(points: np.ndarray, k: int = 20, consistent: bool = True) -
     """
     Estimate normals via PCA of k-nearest neighbors.
     Uses Open3D when available (fast, with MST-based consistent orientation).
-    Falls back to a vectorized sklearn implementation.
+    Falls back to a vectorized SciPy/numpy implementation.
     Returns (N,3) array of unit normals.
     """
     # Fast path: Open3D (vectorised C++ implementation + MST orientation)
@@ -31,7 +29,7 @@ def estimate_normals(points: np.ndarray, k: int = 20, consistent: bool = True) -
     except ImportError:
         pass
 
-    # Fallback: sklearn KDTree with batched query (avoids per-point tree lookups)
+    # Fallback: SciPy KDTree with batched query (avoids per-point tree lookups)
     tree = KDTree(points)
     _, idx = tree.query(points, k=k)   # (N, k) — single batched call
     normals = np.zeros_like(points)
@@ -118,8 +116,7 @@ def cluster_feature_points(
     if len(feature_pts) < min_samples:
         return []
 
-    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(feature_pts)
-    labels = clustering.labels_
+    labels = _dbscan_labels(feature_pts, eps=eps, min_samples=min_samples)
     unique_labels = set(labels)
     clusters = []
     for lab in unique_labels:
@@ -132,6 +129,41 @@ def cluster_feature_points(
     return clusters
 
 
+def _dbscan_labels(points: np.ndarray, eps: float, min_samples: int) -> np.ndarray:
+    """Minimal DBSCAN implementation for small feature-point clusters."""
+    n = len(points)
+    labels = np.full(n, -1, dtype=np.int64)
+    if n == 0:
+        return labels
+
+    tree = KDTree(points)
+    neighborhoods = tree.query_ball_point(points, r=float(eps))
+    is_core = np.array([len(nb) >= int(min_samples) for nb in neighborhoods], dtype=bool)
+
+    cluster_id = 0
+    visited = np.zeros(n, dtype=bool)
+    for seed in range(n):
+        if visited[seed]:
+            continue
+        visited[seed] = True
+        if not is_core[seed]:
+            continue
+
+        labels[seed] = cluster_id
+        queue = list(neighborhoods[seed])
+        while queue:
+            j = queue.pop()
+            if not visited[j]:
+                visited[j] = True
+                if is_core[j]:
+                    queue.extend(neighborhoods[j])
+            if labels[j] < 0:
+                labels[j] = cluster_id
+        cluster_id += 1
+
+    return labels
+
+
 def order_points_along_curve(points: np.ndarray) -> np.ndarray:
     """
     Order a set of points that roughly lie on a curve.
@@ -141,9 +173,11 @@ def order_points_along_curve(points: np.ndarray) -> np.ndarray:
     if len(points) < 2:
         return np.arange(len(points))
 
-    pca = PCA(n_components=2)
-    pca.fit(points)
-    proj = pca.transform(points)[:, 0]  # project onto first principal component
+    centered = points - points.mean(axis=0, keepdims=True)
+    cov = centered.T @ centered
+    _, eigvecs = np.linalg.eigh(cov)
+    principal = eigvecs[:, -1]
+    proj = centered @ principal
     order = np.argsort(proj)
     return order
 

@@ -11,9 +11,9 @@ Key design decisions
       ∂L/∂P = A^{-1} ∂L/∂V    (A is symmetric, so A^{-T} = A^{-1}).
   The forward pass uses a pre-factorised scipy sparse Cholesky; the backward
   pass calls the same factorised solver.
-• **Anti-flip regularisation**: a determinant penalty term is added to ensure
-  that near-zero or negative Jacobian determinants produce finite (non-NaN)
-  gradients (§5.3 / §6.4).
+• **Degeneracy regularisation**: a determinant-of-Gram penalty keeps Jacobians
+  away from rank collapse. Signed flips are handled in the inference solver by
+  the signed-area regularizer and backtracking (§5.3 / §6.4).
 • **Truncated unrolling**: iterations 0…K−K_grad run without gradient;
   only the last K_grad iterations contribute to the backward pass (§6.5).
 
@@ -224,7 +224,7 @@ def _local_step_vectorised(
 
 
 # ---------------------------------------------------------------------------
-# Anti-flip determinant penalty  (differentiable)
+# Jacobian degeneracy determinant penalty  (differentiable)
 # ---------------------------------------------------------------------------
 
 def anti_flip_penalty(
@@ -235,13 +235,14 @@ def anti_flip_penalty(
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """
-    Determinant-based anti-flip penalty:
+    Determinant-of-Gram degeneracy penalty:
 
-        P_flip = (1/M) Σ_i  max(0,  ε − det(J_iᵀ J_i))²
+        P_deg = (1/M) Σ_i  max(0,  ε − det(J_iᵀ J_i))²
 
-    Quads with det(JᵀJ) ≥ ε contribute zero; flipped/degenerate quads are
-    pushed towards positive volume.  The smooth maximum prevents NaN gradients
-    at the rounding boundary.
+    Quads with det(JᵀJ) ≥ ε contribute zero; rank-deficient quads are pushed
+    away from zero area.  Since det(JᵀJ) is non-negative, this term does not
+    detect mirror flips; signed flips are handled by the numpy inference
+    regularizer and topology certification.
 
     Returns:
         scalar penalty tensor (grad-tracked).

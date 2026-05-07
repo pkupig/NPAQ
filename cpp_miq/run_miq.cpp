@@ -43,11 +43,13 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct BoundaryStats {
@@ -528,15 +530,20 @@ static void try_close_single_boundary_slit(
     Eigen::MatrixXi& quadF)
 {
     BoundaryStats before = boundary_stats_quad(quadF);
-    if (before.boundary_loops != 1 || before.boundary_chains != 0) return;
+    if (before.boundary_edges == 0) return;
+    if (before.boundary_chains != 0) return;  // only handle clean loops
     int accepted = 0;
     bool changed = true;
     while (changed) {
         changed = false;
         auto loops = extract_boundary_loops_quad(quadF);
-        if (loops.size() != 1) break;
-        const std::vector<int>& loop = loops[0];
-        if ((int)loop.size() < 64) break;
+        if (loops.empty()) break;
+        // Process the largest loop each iteration
+        int best_loop_idx = 0;
+        for (int li = 1; li < (int)loops.size(); ++li)
+            if (loops[li].size() > loops[best_loop_idx].size()) best_loop_idx = li;
+        const std::vector<int>& loop = loops[best_loop_idx];
+        if ((int)loop.size() < 16) break;
 
         Eigen::MatrixXd pts(loop.size(), 3);
         for (int i = 0; i < (int)loop.size(); ++i) pts.row(i) = quadV.row(loop[i]);
@@ -998,7 +1005,7 @@ static bool extract_quads_barycentric(
     int degenerate_uv = 0;
     int seam_consensus_merges = 0;
     const double mesh_diag = (V.colwise().maxCoeff() - V.colwise().minCoeff()).norm();
-    const double seam_merge_dist = 0.01 * std::max(1e-8, mesh_diag);
+    const double seam_merge_dist = 0.025 * std::max(1e-8, mesh_diag);
 
     for (int f = 0; f < F_count; ++f) {
         Eigen::Vector2d uv0 = UV.row(FUV(f,0)).transpose();
@@ -1435,6 +1442,147 @@ static bool extract_quads_libqex(
 #endif  // HAS_LIBQEX
 
 
+// ─── Seam-aware boundary welding ─────────────────────────────────────────────
+//
+//  Uses the seamsF matrix (from cut_mesh_from_singularities) to identify which
+//  edges of the original triangle mesh were cut.  After barycentric quad
+//  extraction, these cut edges appear as open boundary edges in the quad mesh.
+//  For each cut edge (va,vb), we find all quad-mesh boundary vertices within
+//  weld_thresh of the 3D line segment [V(va), V(vb)] and cluster-weld pairs
+//  that are very close in 3D.  This is far more accurate than the pure-geometric
+//  slit-closing heuristic because it restricts the search to real seam locations.
+
+static void weld_seam_boundaries(
+    const Eigen::MatrixXd& V_orig,
+    const Eigen::MatrixXi& F_orig,
+    const Eigen::MatrixXi& seamsF,
+    Eigen::MatrixXd& quadV,
+    Eigen::MatrixXd& quadVN,
+    Eigen::MatrixXi& quadF)
+{
+    // ── Collect seam edges ────────────────────────────────────────────────────
+    // seamsF(f, k) != 0  →  edge from F(f,k) to F(f,(k+1)%3) is a cut seam.
+    std::vector<std::pair<int,int>> seam_edges;
+    {
+        std::set<std::pair<int,int>> seen;
+        for (int f = 0; f < F_orig.rows(); ++f)
+            for (int k = 0; k < 3; ++k)
+                if (seamsF(f, k) != 0) {
+                    int va = F_orig(f, k), vb = F_orig(f, (k+1)%3);
+                    if (va > vb) std::swap(va, vb);
+                    if (!seen.count({va, vb})) {
+                        seen.insert({va, vb});
+                        seam_edges.push_back({va, vb});
+                    }
+                }
+    }
+    if (seam_edges.empty()) return;
+    std::cout << "[run_miq] Seam-aware weld: " << seam_edges.size() << " cut edges found.\n";
+
+    // ── Find boundary vertices of quad mesh ───────────────────────────────────
+    using QEdge = std::pair<int,int>;
+    std::map<QEdge, int> edge_count;
+    for (int i = 0; i < (int)quadF.rows(); ++i)
+        for (int k = 0; k < 4; ++k) {
+            int a = quadF(i,k), b = quadF(i,(k+1)%4);
+            if (a > b) std::swap(a, b);
+            edge_count[{a,b}]++;
+        }
+    std::set<int> boundary_set;
+    for (const auto& kv : edge_count)
+        if (kv.second == 1) {
+            boundary_set.insert(kv.first.first);
+            boundary_set.insert(kv.first.second);
+        }
+    if (boundary_set.empty()) return;
+    std::vector<int> bverts(boundary_set.begin(), boundary_set.end());
+
+    double mesh_diag = (V_orig.colwise().maxCoeff() - V_orig.colwise().minCoeff()).norm();
+    const double near_thresh  = 0.06 * mesh_diag;  // search radius around each seam edge
+    const double weld_thresh  = 0.025 * mesh_diag; // max 3D distance to weld a pair
+
+    // ── For each seam edge, find quad boundary vertices near it and weld pairs ─
+    // Union-find
+    std::unordered_map<int,int> parent;
+    std::function<int(int)> find_root = [&](int v) -> int {
+        if (!parent.count(v)) return v;
+        return parent[v] = find_root(parent[v]);
+    };
+    auto unite = [&](int a, int b) {
+        a = find_root(a); b = find_root(b);
+        if (a != b) parent[b] = a;
+    };
+
+    int total_welds = 0;
+    for (const auto& se : seam_edges) {
+        const Eigen::Vector3d pa = V_orig.row(se.first).transpose();
+        const Eigen::Vector3d pb = V_orig.row(se.second).transpose();
+        const double seg_len = (pb - pa).norm();
+        const Eigen::Vector3d seg_dir = (seg_len > 1e-10) ? (pb - pa) / seg_len
+                                                          : Eigen::Vector3d(0,0,0);
+
+        // Gather boundary vertices within near_thresh of segment (pa,pb)
+        std::vector<int> near;
+        for (int vi : bverts) {
+            const Eigen::Vector3d p = quadV.row(vi).transpose();
+            double t = (seg_len > 1e-10) ? (p - pa).dot(seg_dir) / seg_len : 0.0;
+            t = std::max(0.0, std::min(1.0, t));
+            const Eigen::Vector3d closest = pa + t * (pb - pa);
+            if ((p - closest).norm() < near_thresh) near.push_back(vi);
+        }
+        if ((int)near.size() < 2) continue;
+
+        // Weld pairs that are within weld_thresh of each other
+        for (int i = 0; i < (int)near.size(); ++i)
+            for (int j = i+1; j < (int)near.size(); ++j) {
+                int ri = find_root(near[i]), rj = find_root(near[j]);
+                if (ri == rj) continue;
+                double d = (quadV.row(near[i]) - quadV.row(near[j])).norm();
+                if (d < weld_thresh) {
+                    // Move canonical representative to midpoint
+                    quadV.row(ri) = 0.5 * (quadV.row(ri) + quadV.row(rj));
+                    Eigen::Vector3d n = (quadVN.row(ri) + quadVN.row(rj)).transpose();
+                    double nn = n.norm();
+                    if (nn > 1e-10) quadVN.row(ri) = (n / nn).transpose();
+                    unite(near[i], near[j]);
+                    ++total_welds;
+                }
+            }
+    }
+    if (total_welds == 0) return;
+
+    // Apply union-find remapping to quadF
+    Eigen::MatrixXi newF = quadF;
+    for (int i = 0; i < (int)newF.rows(); ++i)
+        for (int k = 0; k < 4; ++k)
+            newF(i,k) = find_root(newF(i,k));
+
+    // Remove quads that collapsed (< 4 unique vertices after remapping)
+    std::vector<std::array<int,4>> kept;
+    kept.reserve(newF.rows());
+    for (int i = 0; i < (int)newF.rows(); ++i) {
+        std::set<int> uniq;
+        for (int k = 0; k < 4; ++k) uniq.insert(newF(i,k));
+        if ((int)uniq.size() == 4)
+            kept.push_back({newF(i,0), newF(i,1), newF(i,2), newF(i,3)});
+    }
+    if (kept.empty()) return;
+
+    quadF.resize((int)kept.size(), 4);
+    for (int i = 0; i < (int)kept.size(); ++i)
+        for (int k = 0; k < 4; ++k)
+            quadF(i,k) = kept[i][k];
+
+    compress_quad_mesh(quadV, quadVN, quadF);
+
+    // Recount remaining boundary
+    BoundaryStats bs = boundary_stats_quad(quadF);
+    std::cout << "[run_miq] Seam-aware weld: " << total_welds << " vertex pairs welded"
+              << "  →  boundary edges=" << bs.boundary_edges
+              << ", loops=" << bs.boundary_loops << "\n";
+}
+
+
 // ─── OBJ writer ───────────────────────────────────────────────────────────────
 
 static void write_quad_obj(const std::string& path,
@@ -1455,18 +1603,30 @@ static void write_quad_obj(const std::string& path,
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
+static void print_usage(std::ostream& out)
+{
+    out << "Usage: run_miq <mesh.obj> <u_real.txt> <u_imag.txt> <out_quad.obj>\n"
+        << "               [gradient_size=20] [stiffness=5]\n"
+        << "               [direct_round=1] [iter=5]\n"
+        << "               [pd1.txt] [pd2.txt]\n"
+        << "\n"
+        << "  u_real/u_imag: per-vertex GL cross-field (N×1 each).\n"
+        << "  pd1/pd2:       optional per-face directions (F×3); used only\n"
+        << "                 for comb_frame_field. Omit for isotropic field.\n";
+}
+
 int main(int argc, char* argv[])
 {
+    if (argc == 2) {
+        const std::string arg = argv[1];
+        if (arg == "--help" || arg == "-h") {
+            print_usage(std::cout);
+            return 0;
+        }
+    }
+
     if (argc < 5) {
-        std::cerr
-            << "Usage: run_miq <mesh.obj> <u_real.txt> <u_imag.txt> <out_quad.obj>\n"
-            << "               [gradient_size=20] [stiffness=5]\n"
-            << "               [direct_round=1] [iter=5]\n"
-            << "               [pd1.txt] [pd2.txt]\n"
-            << "\n"
-            << "  u_real/u_imag: per-vertex GL cross-field (N×1 each).\n"
-            << "  pd1/pd2:       optional per-face directions (F×3); used only\n"
-            << "                 for comb_frame_field. Omit for isotropic field.\n";
+        print_usage(std::cerr);
         return 1;
     }
 
@@ -1637,6 +1797,9 @@ int main(int argc, char* argv[])
               << quadV.rows() << " vertices.\n";
 
     fix_quad_winding(quadV, quadVN, quadF);
+    // Step 1: seam-aware welding using cut graph topology (seamsF)
+    weld_seam_boundaries(V, F, seamsF, quadV, quadVN, quadF);
+    // Step 2: geometry-based slit closing for remaining open seams
     try_close_single_boundary_slit(quadV, quadVN, quadF);
     try_absorb_small_boundary_loop(quadV, quadVN, quadF);
     try_close_single_boundary_slit(quadV, quadVN, quadF);

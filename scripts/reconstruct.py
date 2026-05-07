@@ -36,8 +36,8 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.models.dgcnn import (
-    DGCNN, load_legacy_checkpoint, infer_in_dims_from_checkpoint,
-    infer_predict_singularity_from_checkpoint, infer_predict_confidence_from_checkpoint
+    DGCNN, infer_in_dims_from_checkpoint,
+    infer_predict_confidence_from_checkpoint,
 )
 from src.geometry.metric_utils import params_to_tensor
 from src.geometry.laplacian import smooth_metric_field_implicit
@@ -134,7 +134,10 @@ def _make_adaptive_profiles(
         tightened['igl_stiffness'] = min(20.0, max(base_s + 3.0, base_s * 1.3))
         tightened['igl_gradient_size'] = max(40.0 if not closed_input else 20.0, base_g * 0.75)
         tightened['igl_miq_iter'] = min(40, max(base_iter, 24))
-        tightened['poisson_depth'] = min(10, int(prof.get('poisson_depth', 6)) + 1)
+        if bool(prof.get('adaptive_increase_poisson_depth', False)):
+            tightened['poisson_depth'] = min(10, int(prof.get('poisson_depth', 6)) + 1)
+        else:
+            tightened['poisson_depth'] = int(prof.get('poisson_depth', 6))
         out.append(tightened)
 
         if num_viol > 900 or cotree_viol > 1200:
@@ -194,8 +197,10 @@ def _topology_penalty(report: dict, expected_boundary_loops: int = 0, diag: dict
     """
     excess_loops = max(0, int(report.get('boundary_loops', 0)) - int(expected_boundary_loops))
     return (
+        int(report.get('invalid_vertex_indices', 0)),
         int(report.get('high_multiplicity_edges', 0)),
         int(report.get('nonmanifold_edges', 0)),
+        int(report.get('nonmanifold_vertices', 0)),
         int(report.get('degenerate_faces', 0)),
         int(report.get('duplicate_faces', 0)),
         int(report.get('non_quad_faces', 0)),
@@ -211,8 +216,10 @@ def _topology_penalty(report: dict, expected_boundary_loops: int = 0, diag: dict
 def _repair_penalty(report: dict, expected_boundary_loops: int = 0, diag: dict | None = None) -> tuple:
     excess_loops = max(0, int(report.get('boundary_loops', 0)) - int(expected_boundary_loops))
     return (
+        int(report.get('invalid_vertex_indices', 0)),
         int(report.get('high_multiplicity_edges', 0)),
         int(report.get('nonmanifold_edges', 0)),
+        int(report.get('nonmanifold_vertices', 0)),
         int(report.get('degenerate_faces', 0)),
         int(report.get('duplicate_faces', 0)),
         int(report.get('non_quad_faces', 0)),
@@ -382,6 +389,8 @@ def _post_pd_alt_promotion_accepts(
     if int(alt_rep.get('boundary_chains', 0)) > int(main_rep.get('boundary_chains', 0)):
         return False
     if int(alt_rep.get('nonmanifold_edges', 0)) > int(main_rep.get('nonmanifold_edges', 0)):
+        return False
+    if int(alt_rep.get('nonmanifold_vertices', 0)) > int(main_rep.get('nonmanifold_vertices', 0)):
         return False
     if int(alt_rep.get('duplicate_faces', 0)) > int(main_rep.get('duplicate_faces', 0)):
         return False
@@ -843,8 +852,10 @@ def _topology_candidate_sort_key(cand: tuple):
     cap_ratio = cap_total / float(faces)
     field_pen = _field_penalty(diag)
     return (
+        int(rep.get('invalid_vertex_indices', 0)),
         int(rep.get('high_multiplicity_edges', 0)),
         int(rep.get('nonmanifold_edges', 0)),
+        int(rep.get('nonmanifold_vertices', 0)),
         int(rep.get('degenerate_faces', 0)),
         int(rep.get('duplicate_faces', 0)),
         int(rep.get('non_quad_faces', 0)),
@@ -1349,7 +1360,18 @@ def _build_profile_sequence(
             continue
         merged = dict(base_profile)
         merged.update(rp)
-        profiles.append(merged)
+        if _profile_signature(merged) != _profile_signature(profiles[-1]):
+            profiles.append(merged)
+
+    if closed_input and selection_mode == 'quality':
+        limit_key = 'closed_quality_max_retry_profiles'
+    elif closed_input:
+        limit_key = 'closed_max_retry_profiles'
+    else:
+        limit_key = 'max_retry_profiles'
+    if limit_key in topo_cfg:
+        max_profiles = max(1, int(topo_cfg.get(limit_key, len(profiles))))
+        profiles = profiles[:max_profiles]
     return profiles
 
 
@@ -1449,45 +1471,23 @@ def load_config(path):
 
 
 def load_model(checkpoint_path, device, legacy=False):
-    if legacy:
-        print("  [model] Loading legacy 4-output checkpoint …")
-        ckpt = torch.load(checkpoint_path, map_location=device)
-        cfg  = ckpt.get('config', {}).get('model', {})
-        model = load_legacy_checkpoint(
-            checkpoint_path, device,
-            k=cfg.get('k', 20),
-            emb_dims=cfg.get('emb_dims', 256),
-            dropout=cfg.get('dropout', 0.5),
-        )
-    else:
-        ckpt  = torch.load(checkpoint_path, map_location=device)
-        mcfg  = ckpt.get('config', {}).get('model', {})
-        state = ckpt.get('model_state_dict', ckpt)
-        # Infer in_dims from actual weight shape — config field may be absent in
-        # old checkpoints that were saved before in_dims was added to train.yaml.
-        in_dims = infer_in_dims_from_checkpoint(state)
-        predict_singularity = infer_predict_singularity_from_checkpoint(state)
-        predict_confidence = infer_predict_confidence_from_checkpoint(state)
-        model = DGCNN(
-            k=mcfg.get('k', 20),
-            emb_dims=mcfg.get('emb_dims', 256),
-            dropout=mcfg.get('dropout', 0.5),
-            in_dims=in_dims,
-            predict_singularity=predict_singularity,
-            predict_confidence=predict_confidence,
-            max_log_half=mcfg.get('max_log_half', 1.5),
-        ).to(device)
-        # Try strict load; fall back to legacy loader on mismatch
-        try:
-            model.load_state_dict(ckpt['model_state_dict'], strict=True)
-        except RuntimeError:
-            print("  [model] Strict load failed — trying legacy key remapping …")
-            model = load_legacy_checkpoint(
-                checkpoint_path, device,
-                k=mcfg.get('k', 20),
-                emb_dims=mcfg.get('emb_dims', 256),
-                dropout=mcfg.get('dropout', 0.5),
-            )
+    # `legacy` arg retained for CLI back-compat; ignored after the loss-surgery
+    # cleanup deleted the legacy checkpoint loader.
+    del legacy
+    ckpt  = torch.load(checkpoint_path, map_location=device)
+    mcfg  = ckpt.get('config', {}).get('model', {})
+    state = ckpt.get('model_state_dict', ckpt)
+    in_dims = infer_in_dims_from_checkpoint(state)
+    predict_confidence = infer_predict_confidence_from_checkpoint(state)
+    model = DGCNN(
+        k=mcfg.get('k', 20),
+        emb_dims=mcfg.get('emb_dims', 256),
+        dropout=mcfg.get('dropout', 0.5),
+        in_dims=in_dims,
+        predict_confidence=predict_confidence,
+        max_log_half=mcfg.get('max_log_half', 1.5),
+    ).to(device)
+    model.load_state_dict(state, strict=True)
     model.eval()
     return model
 
@@ -1598,12 +1598,12 @@ def predict_metric_field(model, points, k_neighbors, device, normals=None):
         end = min(i + batch_pred, N)
         x   = tensor_feats[i:end].transpose(2, 1)    # (B, in_dims, k)
         with torch.no_grad():
-            out = model(x)                             # (B, 7) or (B, 4) legacy
+            out = model(x)                             # (B, 4) metric or (B, 5+) metric+confidence
         if out.shape[1] >= 4:
             s1 = out[:, 0]; s2 = out[:, 1]
             c  = out[:, 2]; s  = out[:, 3]
             metric_field[i:end] = params_to_tensor(s1, s2, c, s).cpu().numpy()
-        if out.shape[1] in (5, 8):
+        if out.shape[1] >= 5:
             confidence[i:end] = out[:, 4].clamp(0.0, 1.0).detach().cpu().numpy()
     return metric_field, all_basis, confidence
 
@@ -1794,6 +1794,13 @@ def main():
         'igl_stiffness': float(miq_cfg.get('igl_stiffness', 5.0)),
         'igl_direct_round': bool(miq_cfg.get('igl_direct_round', True)),
         'igl_miq_iter': int(miq_cfg.get('igl_miq_iter', 5)),
+        # P3: adaptive stiffness retry
+        'igl_stiffness_schedule': (
+            tuple(float(x) for x in miq_cfg['igl_stiffness_schedule'])
+            if 'igl_stiffness_schedule' in miq_cfg else None
+        ),
+        'igl_foldover_threshold': int(miq_cfg.get('igl_foldover_threshold', 0)),
+        'adaptive_increase_poisson_depth': bool(miq_cfg.get('adaptive_increase_poisson_depth', False)),
     }
     closed_input = expected_boundary_loops == 0
     profile_overrides = {}
@@ -2062,11 +2069,14 @@ def main():
                     igl_stiffness=float(prof['igl_stiffness']),
                     igl_direct_round=bool(prof.get('igl_direct_round', True)),
                     igl_miq_iter=int(prof.get('igl_miq_iter', 5)),
+                    stiffness_schedule=prof.get('igl_stiffness_schedule'),
+                    foldover_threshold=int(prof.get('igl_foldover_threshold', 0)),
                 )
             else:
                 out = initial_quad_mesh_from_pointcloud(
                     points,
                     smoothed_lcf,
+                    metric_basis=basis,
                     guidance_confidence=confidence,
                     guidance_override=guidance_override,
                     guidance_override_weight=guidance_override_weight,
@@ -2090,6 +2100,8 @@ def main():
                     igl_stiffness=float(prof['igl_stiffness']),
                     igl_direct_round=bool(prof.get('igl_direct_round', True)),
                     igl_miq_iter=int(prof.get('igl_miq_iter', 5)),
+                    stiffness_schedule=prof.get('igl_stiffness_schedule'),
+                    foldover_threshold=int(prof.get('igl_foldover_threshold', 0)),
                 )
             if isinstance(out, tuple) and len(out) == 3:
                 qv, qf, qdiag = out
@@ -2415,6 +2427,8 @@ def main():
                                 igl_stiffness=float(remesh_prof['igl_stiffness']),
                                 igl_direct_round=bool(remesh_prof.get('igl_direct_round', True)),
                                 igl_miq_iter=int(remesh_prof.get('igl_miq_iter', 5)),
+                                stiffness_schedule=remesh_prof.get('igl_stiffness_schedule'),
+                                foldover_threshold=int(remesh_prof.get('igl_foldover_threshold', 0)),
                             )
                         except Exception as exc:
                             print(f"  [topo] boundary MIQ remesh failed: {exc}")
@@ -2600,7 +2614,8 @@ def main():
                 f"  [topo] attempt {ai}/{len(profiles)} -> "
                 f"{'PASS' if ok_case else 'FAIL'} "
                 f"(quads={len(qf)}, use_igl={bool(prof['use_igl_backend'])}, "
-                f"g={float(prof['gradient_size'])}, mu={float(prof['crossfield_mu'])}, "
+                f"igl_g={float(prof.get('igl_gradient_size', prof.get('gradient_size', 0.0)))}, "
+                f"mu={float(prof['crossfield_mu'])}, "
                 f"boundary_edges={int(rep.get('boundary_edges', 0))})"
             )
             sing = qdiag.get('crossfield_singularities')

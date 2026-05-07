@@ -88,8 +88,8 @@ def _neural_crossfield(V, F, frames, checkpoint_path, k_neighbors=20, device=Non
     import torch
     from scipy.spatial import KDTree
     from src.models.dgcnn import (
-        DGCNN, load_legacy_checkpoint, infer_in_dims_from_checkpoint,
-        infer_predict_singularity_from_checkpoint, infer_predict_confidence_from_checkpoint
+        DGCNN, infer_in_dims_from_checkpoint,
+        infer_predict_confidence_from_checkpoint,
     )
     from src.geometry.metric_utils import params_to_tensor
     from src.geometry.laplacian import smooth_metric_field_implicit
@@ -104,24 +104,17 @@ def _neural_crossfield(V, F, frames, checkpoint_path, k_neighbors=20, device=Non
     k_nn  = mcfg.get('k', k_neighbors)
     state = ckpt.get('model_state_dict', ckpt)
     in_dims = infer_in_dims_from_checkpoint(state)
-    predict_singularity = infer_predict_singularity_from_checkpoint(state)
     predict_confidence = infer_predict_confidence_from_checkpoint(state)
 
-    try:
-        model = DGCNN(
-            k=k_nn,
-            emb_dims=mcfg.get('emb_dims', 256),
-            dropout=mcfg.get('dropout', 0.5),
-            in_dims=in_dims,
-            predict_singularity=predict_singularity,
-            predict_confidence=predict_confidence,
-            max_log_half=mcfg.get('max_log_half', 1.5),
-        ).to(device)
-        model.load_state_dict(ckpt['model_state_dict'], strict=True)
-    except (KeyError, RuntimeError):
-        model = load_legacy_checkpoint(checkpoint_path, device,
-                                       k=k_nn, emb_dims=256, dropout=0.5)
-        in_dims = model.encoder.conv1[0].in_channels // 2
+    model = DGCNN(
+        k=k_nn,
+        emb_dims=mcfg.get('emb_dims', 256),
+        dropout=mcfg.get('dropout', 0.5),
+        in_dims=in_dims,
+        predict_confidence=predict_confidence,
+        max_log_half=mcfg.get('max_log_half', 1.5),
+    ).to(device)
+    model.load_state_dict(state, strict=True)
     model.eval()
 
     points = V  # use mesh vertices as the "point cloud"
@@ -249,8 +242,10 @@ def _topology_penalty(report: dict) -> tuple:
     Lower is better. Prioritize manifoldness/integrity over boundary count.
     """
     return (
+        int(report.get('invalid_vertex_indices', 0)),
         int(report.get('high_multiplicity_edges', 0)),
         int(report.get('nonmanifold_edges', 0)),
+        int(report.get('nonmanifold_vertices', 0)),
         int(report.get('degenerate_faces', 0)),
         int(report.get('duplicate_faces', 0)),
         int(report.get('non_quad_faces', 0)),

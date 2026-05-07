@@ -1,73 +1,54 @@
 data:
   type: synthetic
   k_neighbors: 32
-  consistency_queries: 8
-  consistency_radius_ratio: 0.22
   noise_std: 0.003
   cache: false
-  # Reduced from 50000: faster epochs (each sample = KDTree + LCF + synthesis,
-  # 50k samples serial on CPU ≈ 2–4 min/epoch; 20k ≈ 1 min/epoch).
-  # 20k distinct random patches per epoch is sufficient for stable gradients.
   synthetic_train_points: 20000
   synthetic_val_points: 10000
+  # Coverage-extended distribution: original 6 closed-form shapes + 3 new
+  # families (plane, gaussian_bump, monge_patch) that broaden the supp(D_syn)
+  # on the II_x manifold. monge_patch resamples (a, b, c) per call → covers
+  # the full (κ1, κ2) ∈ ℝ² plane.
   proportions:
-    cylinder:  0.20   # strong axial anisotropy
-    torus:     0.25   # moderate varying anisotropy
-    saddle:    0.20   # negative Gaussian curvature
-    sphere:    0.10   # reduced isotropic share to strengthen directional learning
-    ellipsoid: 0.25   # intermediate anisotropy, spatially varying
+    cylinder:      0.10   # strong axial anisotropy
+    torus:         0.12   # moderate varying anisotropy
+    saddle:        0.10   # symmetric hyperbolic
+    sphere:        0.05   # isotropic baseline
+    ellipsoid:     0.13   # spatially varying
+    box:           0.10   # piecewise planar (sharp-ish CAD)
+    plane:         0.10   # κ → 0 coverage
+    gaussian_bump: 0.10   # smooth κ variation, mixed elliptic/hyperbolic
+    monge_patch:   0.20   # random quadric → full (κ1, κ2) plane
 
 model:
   k: 20
   emb_dims: 256
-  dropout: 0.2   # was 0.5; reduced to close the train/val gap and get readable loss curves
-  in_dims: 6     # 3=coords only, 6=coords+normals (normals encode curvature directly)
+  dropout: 0.2
+  in_dims: 6          # 3=coords only, 6=coords+normals (recommended)
   max_log_half: 1.5
   predict_confidence: true
-  predict_singularity: false
 
 loss:
-  lambda_dir:  0.1    # 4-RoSy loss converges cleanly; 0.3 over-weighted directional vs metric
-  dir_stop_threshold: 0.05  # hard-mask near-isotropic samples in directional loss
-  lambda_sing: 0.0
-  lambda_ph:   0.0
-  ph_euler_char: 0.0  # patch mini-batches default to zero net index target
-  lambda_j:    0.0    # §6.4 — end-to-end Jacobian loss; set 0 until metric head converges
-  lambda_conf: 0.1    # confidence supervision (target = anisotropy reliability)
-  # Train-time differentiable topology surrogate:
-  # determinant barrier + condition barrier + anisotropy-weighted singularity entropy.
-  lambda_topo: 0.01
-  topo_det_eps: 1.0e-3
+  lambda_aniso: 0.1   # eigenvalue-ratio log-distance; corrects LogEuclidean trace bias
+  lambda_conf:  0.1   # directional-saliency supervision (legacy field name: confidence)
+  lambda_topo:  0.01  # det + cond barriers (metric-degeneracy guard)
+  lambda_j:     0.0   # optional unrolled PD loss; current train.py fails fast if >0
+  topo_det_eps:  1.0e-3
   topo_cond_max: 50.0
-  topo_entropy_weight: 0.1
-  topo_field_weight: 0.5
-  topo_ring_weight: 0.25
-  topo_cons_metric_weight: 0.75
-  topo_cons_dir_weight: 0.35
-  topo_consistency_sigma: 0.35
-  topo_ring_min_queries: 6
 
 training:
-  batch_size: 64      # larger batch → fewer steps/epoch, more stable gradients
+  batch_size: 64
   epochs: 400
   lr: 0.0001
   weight_decay: 1.0e-5
-  # lr_scheduler: 'plateau' uses ReduceLROnPlateau (only decays when val stagnates).
-  # 'step' uses StepLR (decays every lr_decay_step epochs).
-  lr_scheduler: plateau
-  lr_decay_gamma: 0.5    # halving factor (used by both schedulers)
-  lr_patience: 20        # plateau only: epochs without improvement before decay
-  lr_min: 1.0e-6         # plateau only: LR floor
-  lr_decay_step: 100     # step only: kept for backward compat / --resume
-  num_workers: 0      # WSL2 multiprocessing instability — keep at 0
-  mixed_precision: false   # set true if CUDA is available for 2× speedup
+  lr_scheduler: plateau   # 'plateau' (ReduceLROnPlateau) or 'step' (StepLR)
+  lr_decay_gamma: 0.5
+  lr_patience: 20
+  lr_min: 1.0e-6
+  lr_decay_step: 100      # only used when lr_scheduler == 'step'
+  num_workers: 0          # WSL2 multiprocessing instability — keep at 0
+  mixed_precision: false
   checkpoint_dir: ./checkpoints
-  # Model selection / early-stop policy.
-  # val_loss = metric + lambda_dir*dir + lambda_conf*conf (all terms together).
-  # Using val_loss ensures early stopping and ReduceLROnPlateau track the same
-  # signal; previously val_metric (metric-only) + val_loss (total) diverged
-  # when directional improved but metric plateaued, causing premature termination.
-  select_by: val_loss
-  early_stop_patience: 150  # was 60; val stochasticity needs wider window to avoid premature stop
+  select_by: val_loss     # 'val_loss' or 'val_metric'
+  early_stop_patience: 150
   early_stop_min_delta: 1.0e-4
-  log_topo_proxy: false

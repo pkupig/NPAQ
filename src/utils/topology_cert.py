@@ -523,6 +523,74 @@ def _boundary_graph_stats(faces: np.ndarray) -> Dict[str, int]:
     }
 
 
+def _vertex_fan_stats(faces: np.ndarray, num_vertices: int) -> Dict[str, int]:
+    """
+    Detect vertices whose incident faces split into multiple disconnected fans.
+
+    Edge incidence catches edge-nonmanifold cases, but a mesh can still be
+    non-manifold at a vertex when two otherwise valid face fans touch only at
+    that vertex.  For each vertex, connect incident faces that share an edge
+    containing the vertex; more than one connected component means a non-
+    manifold vertex fan.
+    """
+    incident_faces: dict[int, list[int]] = defaultdict(list)
+    edge_to_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
+
+    for fi, face in enumerate(faces):
+        f = [int(i) for i in face]
+        for v in set(f):
+            if 0 <= v < num_vertices:
+                incident_faces[v].append(fi)
+        for i in range(len(f)):
+            a, b = f[i], f[(i + 1) % len(f)]
+            if 0 <= a < num_vertices and 0 <= b < num_vertices:
+                edge_to_faces[(a, b) if a < b else (b, a)].append(fi)
+
+    nonmanifold_vertices = 0
+    max_vertex_fan_components = 0
+
+    for v, faces_at_v in incident_faces.items():
+        if len(faces_at_v) <= 1:
+            max_vertex_fan_components = max(max_vertex_fan_components, len(faces_at_v))
+            continue
+
+        adj: dict[int, set[int]] = {fi: set() for fi in faces_at_v}
+        for (a, b), fis in edge_to_faces.items():
+            if v not in (a, b):
+                continue
+            for i, fa in enumerate(fis):
+                if fa not in adj:
+                    continue
+                for fb in fis[i + 1:]:
+                    if fb in adj:
+                        adj[fa].add(fb)
+                        adj[fb].add(fa)
+
+        seen = set()
+        components = 0
+        for seed in faces_at_v:
+            if seed in seen:
+                continue
+            components += 1
+            stack = [seed]
+            seen.add(seed)
+            while stack:
+                cur = stack.pop()
+                for nb in adj[cur]:
+                    if nb not in seen:
+                        seen.add(nb)
+                        stack.append(nb)
+
+        max_vertex_fan_components = max(max_vertex_fan_components, components)
+        if components > 1:
+            nonmanifold_vertices += 1
+
+    return {
+        "nonmanifold_vertices": int(nonmanifold_vertices),
+        "max_vertex_fan_components": int(max_vertex_fan_components),
+    }
+
+
 def certify_quad_topology(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -535,9 +603,11 @@ def certify_quad_topology(
 
     Checks:
     - Optional all-quads requirement.
+    - Face indices are inside the vertex array.
     - No degenerate faces (repeated vertex indices).
     - No duplicate faces (up to cyclic order / reversal).
     - No high-multiplicity edges (>2 incident faces).
+    - No multi-fan non-manifold vertices.
     - Boundary allowance is configurable (edge incidence == 1).
 
     Returns:
@@ -557,10 +627,14 @@ def certify_quad_topology(
             "boundary_loops": 0,
             "high_multiplicity_edges": 0,
             "nonmanifold_edges": 0,
+            "nonmanifold_vertices": 0,
+            "max_vertex_fan_components": 0,
+            "invalid_vertex_indices": 0,
         }
         return False, report
 
     non_quad_faces = int(np.sum([len(f) != 4 for f in F]))
+    invalid_vertex_indices = int(np.sum((F < 0) | (F >= V.shape[0]))) if V.ndim == 2 else int(F.size)
 
     degenerate_faces = 0
     face_keys = Counter()
@@ -587,6 +661,7 @@ def certify_quad_topology(
     duplicate_faces = int(sum(c - 1 for c in face_keys.values() if c > 1))
     boundary_edges = int(sum(c == 1 for c in edge_counts.values()))
     boundary_stats = _boundary_graph_stats(F)
+    vertex_stats = _vertex_fan_stats(F, int(V.shape[0]) if V.ndim == 2 else 0)
     high_mult_edges = int(sum(c > 2 for c in edge_counts.values()))
     # Non-manifold edges are edges shared by more than two faces.
     # Boundary edges (incidence==1) are not non-manifold by themselves and are
@@ -594,6 +669,8 @@ def certify_quad_topology(
     nonmanifold_edges = high_mult_edges
 
     valid = True
+    if invalid_vertex_indices > 0:
+        valid = False
     if require_all_quads and non_quad_faces > 0:
         valid = False
     if degenerate_faces > 0:
@@ -601,6 +678,8 @@ def certify_quad_topology(
     if duplicate_faces > 0:
         valid = False
     if high_mult_edges > 0:
+        valid = False
+    if int(vertex_stats["nonmanifold_vertices"]) > 0:
         valid = False
     if (not allow_boundary) and boundary_edges > 0:
         valid = False
@@ -619,6 +698,9 @@ def certify_quad_topology(
         "boundary_irregular_vertices": int(boundary_stats["boundary_irregular_vertices"]),
         "high_multiplicity_edges": high_mult_edges,
         "nonmanifold_edges": nonmanifold_edges,
+        "nonmanifold_vertices": int(vertex_stats["nonmanifold_vertices"]),
+        "max_vertex_fan_components": int(vertex_stats["max_vertex_fan_components"]),
+        "invalid_vertex_indices": invalid_vertex_indices,
     }
     return valid, report
 
@@ -628,7 +710,8 @@ def format_topology_report(report: Dict[str, int]) -> str:
         "faces={num_faces}, non_quad={non_quad_faces}, degenerate={degenerate_faces}, "
         "duplicate={duplicate_faces}, boundary_edges={boundary_edges}, boundary_loops={boundary_loops}, "
         "boundary_chains={boundary_chains}, irregular_boundary_vertices={boundary_irregular_vertices}, "
-        "high_mult_edges={high_multiplicity_edges}, nonmanifold_edges={nonmanifold_edges}"
+        "high_mult_edges={high_multiplicity_edges}, nonmanifold_edges={nonmanifold_edges}, "
+        "nonmanifold_vertices={nonmanifold_vertices}, invalid_vertex_indices={invalid_vertex_indices}"
     ).format(**report)
 
 
@@ -1590,4 +1673,3 @@ def cap_rectangular_boundary_loops_with_field(
         V = np.vstack([V, np.asarray(new_vertices, dtype=np.float64)])
     F = np.vstack([F, np.asarray(new_faces, dtype=np.int64)])
     return V, F, int(len(new_faces))
-

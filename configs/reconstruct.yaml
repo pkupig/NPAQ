@@ -72,10 +72,18 @@ miq:
   #   ≤0 = auto-compute from mesh average edge length (recommended).
   #   60 = ~3x auto (21); with 81 holonomy singularities and 2.4x UV overlap,
   #   gradient_size=60 gives ~826 quads with <20 fold-overs (vs 94 at auto=21).
-  igl_gradient_size: 80.0    # open-surface default: favor higher-quality denser quads
+  igl_gradient_size: 32.0    # balanced default; use quality mode/profile for denser quads
   igl_stiffness: 5.0
   igl_direct_round: false    # iterative rounding: more stable for 81 singularities
-  igl_miq_iter: 20           # 20 iterations; localIter=20 in C++
+  igl_miq_iter: 12           # balanced default; quality profiles can raise this
+  # Adaptive stiffness retry. Keep short by default; exhaustive schedules are slow
+  # and did not fix bad cross-fields in smoke tests.
+  igl_stiffness_schedule: [5.0, 8.0]
+  igl_foldover_threshold: 0  # retry until zero fold-overs (or schedule exhausted)
+  # Keep adaptive retries on the same Poisson carrier by default. Increasing
+  # depth can make the C++ MIQ backend unstable on large fields; opt in only
+  # when debugging field resolution rather than topology extraction.
+  adaptive_increase_poisson_depth: false
 
 pd:
   mu: 0.1                    # γ smoothness weight in A = I + γ Lᵀ L
@@ -170,7 +178,7 @@ topology:
   cap_even_boundary_loops_field_max_loop_len: 1024
   cap_even_boundary_loops_field_shrink: 0.35
   cap_even_boundary_loops_field_align_min_strength: 0.1
-  remesh_boundary_with_miq: true
+  remesh_boundary_with_miq: false
   remesh_boundary_min_edges: 200
   remesh_boundary_min_loops: 1
   remesh_boundary_max_faces: 60000
@@ -180,7 +188,10 @@ topology:
   prune_boundary_fragments: true
   prune_boundary_fragments_min_faces: 50
   prune_boundary_fragments_min_ratio: 0.25
-  max_adaptive_profiles: 4
+  max_retry_profiles: 2
+  closed_max_retry_profiles: 3
+  closed_quality_max_retry_profiles: 4
+  max_adaptive_profiles: 2
   selection_dense_face_ratio: 0.8
   selection_quality_max_winding_ratio: 0.03
   selection_quality_max_final_miq_flips: 5
@@ -451,19 +462,19 @@ topology:
   # Open-surface retry profiles (merged over `miq` base params).
   retry_profiles:
     - crossfield_mu: 20.0
-      poisson_depth: 7
+      poisson_depth: 6
       use_igl_backend: true
-      igl_gradient_size: 80.0
+      igl_gradient_size: 48.0
       igl_stiffness: 5.0
     - crossfield_mu: 30.0
-      poisson_depth: 8
+      poisson_depth: 6
       use_igl_backend: true
-      igl_gradient_size: 80.0
+      igl_gradient_size: 56.0
       igl_stiffness: 8.0
     - crossfield_mu: 35.0
-      poisson_depth: 9
+      poisson_depth: 6
       use_igl_backend: true
-      igl_gradient_size: 80.0
+      igl_gradient_size: 64.0
       igl_stiffness: 10.0
   # Closed-surface overrides: start from low-density stable topology and only
   # then increase density. This keeps sphere/torus repair logic from degrading
@@ -475,97 +486,27 @@ topology:
     igl_gradient_size: 20.0
     igl_stiffness: 5.0
   closed_quality_profile_overrides:
-    crossfield_mu: 20.0
-    poisson_depth: 7
+    crossfield_mu: 14.0
+    poisson_depth: 6
     use_igl_backend: true
-    igl_gradient_size: 72.0
+    igl_gradient_size: 44.0
     igl_stiffness: 6.0
   closed_quality_retry_profiles:
-    - crossfield_mu: 11.8
-      poisson_depth: 7
-      use_igl_backend: true
-      igl_gradient_size: 37.0
-      igl_stiffness: 4.00
-    - crossfield_mu: 11.85
-      poisson_depth: 7
-      use_igl_backend: true
-      igl_gradient_size: 37.25
-      igl_stiffness: 4.02
-    - crossfield_mu: 11.9
-      poisson_depth: 7
-      use_igl_backend: true
-      igl_gradient_size: 37.5
-      igl_stiffness: 4.05
-    - crossfield_mu: 11.95
-      poisson_depth: 7
-      use_igl_backend: true
-      igl_gradient_size: 37.75
-      igl_stiffness: 4.08
-    - crossfield_mu: 12.0
-      poisson_depth: 7
-      use_igl_backend: true
-      igl_gradient_size: 38.0
-      igl_stiffness: 4.10
-    - crossfield_mu: 12.25
-      poisson_depth: 7
-      use_igl_backend: true
-      igl_gradient_size: 39.0
-      igl_stiffness: 4.18
-    - crossfield_mu: 12.1
-      poisson_depth: 7
-      use_igl_backend: true
-      igl_gradient_size: 38.5
-      igl_stiffness: 4.12
-    - crossfield_mu: 12.5
-      poisson_depth: 7
-      use_igl_backend: true
-      igl_gradient_size: 40.0
-      igl_stiffness: 4.25
-    - crossfield_mu: 13.0
-      poisson_depth: 7
-      use_igl_backend: true
-      igl_gradient_size: 42.0
-      igl_stiffness: 4.35
     - crossfield_mu: 14.0
-      poisson_depth: 7
+      poisson_depth: 6
       use_igl_backend: true
       igl_gradient_size: 44.0
-      igl_stiffness: 4.5
-    - crossfield_mu: 15.0
-      poisson_depth: 7
-      use_igl_backend: true
-      igl_gradient_size: 48.0
-      igl_stiffness: 4.75
+      igl_stiffness: 6.0
     - crossfield_mu: 16.0
-      poisson_depth: 7
+      poisson_depth: 6
       use_igl_backend: true
       igl_gradient_size: 52.0
-      igl_stiffness: 5.0
-    - crossfield_mu: 18.0
-      poisson_depth: 7
+      igl_stiffness: 6.5
+    - crossfield_mu: 20.0
+      poisson_depth: 6
       use_igl_backend: true
       igl_gradient_size: 60.0
-      igl_stiffness: 5.5
-    - crossfield_mu: 25.0
-      poisson_depth: 8
-      use_igl_backend: true
-      igl_gradient_size: 76.0
       igl_stiffness: 7.0
-    - crossfield_mu: 27.5
-      poisson_depth: 8
-      use_igl_backend: true
-      igl_gradient_size: 78.0
-      igl_stiffness: 7.5
-    - crossfield_mu: 30.0
-      poisson_depth: 8
-      use_igl_backend: true
-      igl_gradient_size: 80.0
-      igl_stiffness: 8.0
-    - crossfield_mu: 35.0
-      poisson_depth: 9
-      use_igl_backend: true
-      igl_gradient_size: 80.0
-      igl_stiffness: 10.0
   closed_retry_profiles:
     - crossfield_mu: 10.0
       poisson_depth: 6
@@ -582,33 +523,3 @@ topology:
       use_igl_backend: true
       igl_gradient_size: 36.0
       igl_stiffness: 5.0
-    - crossfield_mu: 10.0
-      poisson_depth: 6
-      use_igl_backend: true
-      igl_gradient_size: 40.0
-      igl_stiffness: 5.0
-    - crossfield_mu: 20.0
-      poisson_depth: 7
-      use_igl_backend: true
-      igl_gradient_size: 72.0
-      igl_stiffness: 6.0
-    - crossfield_mu: 25.0
-      poisson_depth: 8
-      use_igl_backend: true
-      igl_gradient_size: 76.0
-      igl_stiffness: 7.0
-    - crossfield_mu: 20.0
-      poisson_depth: 7
-      use_igl_backend: true
-      igl_gradient_size: 60.0
-      igl_stiffness: 5.0
-    - crossfield_mu: 30.0
-      poisson_depth: 8
-      use_igl_backend: true
-      igl_gradient_size: 80.0
-      igl_stiffness: 8.0
-    - crossfield_mu: 35.0
-      poisson_depth: 9
-      use_igl_backend: true
-      igl_gradient_size: 80.0
-      igl_stiffness: 10.0

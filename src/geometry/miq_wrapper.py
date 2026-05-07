@@ -54,6 +54,30 @@ _DEFAULT_BINARY = os.path.join(
 )
 
 
+def _lift_lcf_metric_to_world(metric_lcf: np.ndarray, basis: np.ndarray) -> np.ndarray:
+    """Lift per-point 2D LCF metrics to 3D tangent-plane tensors."""
+    R = np.asarray(basis, dtype=np.float64)[:, :, :2]
+    M = np.asarray(metric_lcf, dtype=np.float64)
+    if R.shape[0] != M.shape[0] or M.shape[-2:] != (2, 2):
+        raise ValueError(
+            "metric_basis must align with metric_field: "
+            f"metric_field={M.shape}, metric_basis={R.shape}"
+        )
+    return np.einsum('nia,nab,njb->nij', R, M, R)
+
+
+def _project_world_metric_to_frames(metric_world: np.ndarray, frames: np.ndarray) -> np.ndarray:
+    """Project 3D tangent-plane tensors into a mesh vertex frame."""
+    R = np.asarray(frames, dtype=np.float64)
+    M = np.asarray(metric_world, dtype=np.float64)
+    if R.shape[0] != M.shape[0] or M.shape[-2:] != (3, 3):
+        raise ValueError(
+            "metric_world must align with frames: "
+            f"metric_world={M.shape}, frames={R.shape}"
+        )
+    return np.einsum('nia,nij,njb->nab', R, M, R)
+
+
 def _parse_run_miq_diagnostics(stdout: str) -> dict:
     diag: dict = {}
     if not stdout:
@@ -210,6 +234,102 @@ def _solve_crossfield_gl_compat(
     return solve_crossfield_gl(**kwargs)
 
 
+def _count_foldovers(V: np.ndarray, quadF: np.ndarray) -> int:
+    """
+    Vectorised count of fold-over quads (no modification).
+
+    A quad (v0,v1,v2,v3) is a fold-over when the two halves of its
+    diagonal-split triangulation (0-1-2) and (0-2-3) have normals
+    pointing into opposite half-spaces (dot < 0).
+    """
+    if quadF.ndim != 2 or quadF.shape[1] != 4 or quadF.shape[0] == 0:
+        return 0
+    v = V[quadF]                                       # (Q, 4, 3)
+    n_a = np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0])  # (Q, 3)
+    n_b = np.cross(v[:, 2] - v[:, 0], v[:, 3] - v[:, 0])  # (Q, 3)
+    return int(((n_a * n_b).sum(-1) < 0).sum())
+
+
+def _fix_foldover_quads(
+    V: np.ndarray,
+    quadF: np.ndarray,
+    max_iters: int = 5,
+    shrink: float = 0.25,
+) -> Tuple[np.ndarray, int]:
+    """
+    Detect and repair fold-over quads by pulling affected vertices toward
+    their quad centroid.
+
+    A quad (v0,v1,v2,v3) is a fold-over when its two triangulations
+    (0-1-2) and (0-2-3) have normals pointing in opposite half-spaces
+    (dot < 0), meaning the quad self-intersects.
+
+    Repair: each vertex of a bad quad is nudged ``shrink`` fraction toward
+    the quad centroid.  Repeated until no fold-overs remain or max_iters
+    exhausted.  Vertices are moved in 3-D, so surface fidelity is
+    preserved to first order.
+
+    Returns:
+        V_fixed:      vertex array (same shape as V) with repaired positions.
+        total_fixed:  number of fold-overs resolved across all iterations.
+    """
+    V = V.copy().astype(np.float64)
+    total_fixed = 0
+
+    for _ in range(max_iters):
+        fixed_this = 0
+        for q in quadF:
+            v = V[q]                                   # (4, 3)
+            n_a = np.cross(v[1] - v[0], v[2] - v[0])  # tri 0-1-2
+            n_b = np.cross(v[2] - v[0], v[3] - v[0])  # tri 0-2-3
+            if np.dot(n_a, n_b) < 0.0:
+                centroid = v.mean(axis=0)
+                V[q] = (1.0 - shrink) * v + shrink * centroid
+                fixed_this += 1
+        total_fixed += fixed_this
+        if fixed_this == 0:
+            break
+
+    return V, total_fixed
+
+
+def _remove_degenerate_quads(
+    V: np.ndarray,
+    quadF: np.ndarray,
+    min_area_ratio: float = 1e-4,
+) -> np.ndarray:
+    """
+    Remove quads whose area is below ``min_area_ratio * mean_quad_area``.
+
+    Degenerate quads (two nearly-coincident vertices) appear visually as
+    triangles and arise near singularities when MIQ integer transitions don't
+    close perfectly.  Removing them is safe: they contribute zero surface area
+    and are already visually invisible.
+    """
+    if quadF.ndim != 2 or quadF.shape[1] != 4 or quadF.shape[0] == 0:
+        return quadF
+    v = V[quadF]                                        # (Q, 4, 3)
+    # Area via diagonal cross products (two triangle halves)
+    area_a = np.linalg.norm(np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0]), axis=-1)
+    area_b = np.linalg.norm(np.cross(v[:, 2] - v[:, 0], v[:, 3] - v[:, 0]), axis=-1)
+    area   = 0.5 * (area_a + area_b)                   # (Q,)
+    threshold = min_area_ratio * (area.mean() + 1e-30)
+    return quadF[area > threshold]
+
+
+def _compact_quad_mesh(
+    V: np.ndarray,
+    quadF: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Remove orphan vertices left after face pruning; remap indices."""
+    if quadF.ndim != 2 or quadF.shape[1] != 4 or quadF.shape[0] == 0:
+        return V, quadF
+    used = np.unique(quadF)
+    remap = np.empty(V.shape[0], dtype=np.int64)
+    remap[used] = np.arange(len(used), dtype=np.int64)
+    return V[used], remap[quadF]
+
+
 def _prune_quads_to_closed_manifold_subset(quads: np.ndarray) -> np.ndarray:
     """
     Keep only a closed manifold subset (all edges incidence exactly 2), if any.
@@ -346,7 +466,7 @@ def _transfer_metric_to_mesh(
     Nearest-neighbour transfer of per-point metric tensors to mesh vertices.
 
     Returns:
-        M_vert:  (N_mesh, 2, 2) metric tensors.
+        M_vert:  (N_mesh, ..., ...) metric tensors.
     """
     tree = KDTree(points)
     _, idx = tree.query(V_mesh)
@@ -709,6 +829,8 @@ def miq_quadrangulate_igl(
     verbose: bool = True,
     M_vert: Optional[np.ndarray] = None,
     return_diagnostics: bool = False,
+    stiffness_schedule: Optional[Tuple[float, ...]] = None,
+    foldover_threshold: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Run igl::copyleft::comiso::miq via the compiled C++ subprocess binary.
@@ -799,50 +921,133 @@ def miq_quadrangulate_igl(
         if not ph['satisfied']:
             print("[miq_igl]   (approx pre-check on raw field; continuing to C++ MIQ authoritative check)")
 
-    tmpdir = tempfile.mkdtemp(prefix='npaq_miq_')
-    try:
-        mesh_path   = os.path.join(tmpdir, 'mesh.obj')
-        ureal_path  = os.path.join(tmpdir, 'u_real.txt')
-        uimag_path  = os.path.join(tmpdir, 'u_imag.txt')
-        out_path    = os.path.join(tmpdir, 'quad.obj')
+    # ── P3: adaptive stiffness retry ─────────────────────────────────────
+    # Build the stiffness schedule to try.  If stiffness_schedule is given,
+    # it completely overrides `stiffness`; otherwise a single attempt is made.
+    if stiffness_schedule is not None:
+        s_tries = tuple(stiffness_schedule)
+    else:
+        s_tries = (stiffness,)
 
-        _write_tri_obj(mesh_path, V, F)
-        np.savetxt(ureal_path, u_complex.real, fmt='%.9g')
-        np.savetxt(uimag_path, u_complex.imag, fmt='%.9g')
+    def _run_once(s: float) -> Tuple[np.ndarray, np.ndarray, dict]:
+        """Run the C++ MIQ binary once with stiffness s; return (V, F, diag)."""
+        tmpdir = tempfile.mkdtemp(prefix='npaq_miq_')
+        try:
+            mesh_path  = os.path.join(tmpdir, 'mesh.obj')
+            ureal_path = os.path.join(tmpdir, 'u_real.txt')
+            uimag_path = os.path.join(tmpdir, 'u_imag.txt')
+            out_path   = os.path.join(tmpdir, 'quad.obj')
 
-        # New interface: mesh u_real u_imag out [grad_size] [stiffness] [direct_round] [iter]
-        #                [pd1.txt] [pd2.txt]   ← optional; used only for comb_frame_field
-        cmd = [
-            binary_path,
-            mesh_path, ureal_path, uimag_path, out_path,
-            str(gradient_size), str(stiffness),
-            str(int(direct_round)), str(miq_iter),
-        ]
+            _write_tri_obj(mesh_path, V, F)
+            np.savetxt(ureal_path, u_complex.real, fmt='%.9g')
+            np.savetxt(uimag_path, u_complex.imag, fmt='%.9g')
 
-        # Optionally pass per-face PD1/PD2 for anisotropic frame combing.
-        # These are no longer used for mismatch computation (that now comes from u directly).
-        if M_vert is not None:
-            PD1, PD2 = _crossfield_to_face_directions(u_complex, V, F, frame_field, M_vert=M_vert)
-            pd1_path = os.path.join(tmpdir, 'pd1.txt')
-            pd2_path = os.path.join(tmpdir, 'pd2.txt')
-            np.savetxt(pd1_path, PD1, fmt='%.9g')
-            np.savetxt(pd2_path, PD2, fmt='%.9g')
-            cmd += [pd1_path, pd2_path]
+            cmd = [
+                binary_path,
+                mesh_path, ureal_path, uimag_path, out_path,
+                str(gradient_size), str(s),
+                str(int(direct_round)), str(miq_iter),
+            ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+            if M_vert is not None:
+                PD1, PD2 = _crossfield_to_face_directions(
+                    u_complex, V, F, frame_field, M_vert=M_vert
+                )
+                pd1_path = os.path.join(tmpdir, 'pd1.txt')
+                pd2_path = os.path.join(tmpdir, 'pd2.txt')
+                np.savetxt(pd1_path, PD1, fmt='%.9g')
+                np.savetxt(pd2_path, PD2, fmt='%.9g')
+                cmd += [pd1_path, pd2_path]
 
-        if verbose and result.stdout:
-            print(result.stdout, end='')
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"run_miq failed (exit {result.returncode}):\n{result.stderr}"
-            )
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(
+                    "run_miq timed out after 120 s. The cross-field likely has too many "
+                    "singularities. Try a better checkpoint or reduce gradient_size."
+                )
 
-        quadV, quadF = _read_mesh_obj(out_path)
-        miq_diag = _parse_run_miq_diagnostics(result.stdout)
+            if verbose and result.stdout:
+                print(result.stdout, end='')
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"run_miq failed (exit {result.returncode}):\n{result.stderr}"
+                )
 
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+            qV, qF = _read_mesh_obj(out_path)
+            diag   = _parse_run_miq_diagnostics(result.stdout)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        return qV, qF, diag
+
+    # Try each stiffness; keep the result with the fewest fold-overs.
+    best_quadV = best_quadF = best_diag = None
+    best_folds = float('inf')
+    best_stiffness = s_tries[0]
+
+    for s_try in s_tries:
+        try:
+            qV, qF, diag = _run_once(s_try)
+        except RuntimeError as exc:
+            if verbose:
+                print(f"[miq_igl] stiffness={s_try} failed: {exc}")
+            continue
+
+        n_folds = _count_foldovers(qV, qF)
+        if verbose and len(s_tries) > 1:
+            print(f"[miq_igl] stiffness={s_try:.1f} → {qF.shape[0]} quads, "
+                  f"{n_folds} fold-overs")
+
+        if n_folds < best_folds:
+            best_quadV, best_quadF, best_diag = qV, qF, diag
+            best_folds = n_folds
+            best_stiffness = s_try
+
+        if n_folds <= foldover_threshold:
+            break   # good enough — no need to try higher stiffness
+
+    if best_quadV is None:
+        raise RuntimeError("All stiffness attempts failed. Check cross-field quality.")
+
+    quadV, quadF, miq_diag = best_quadV, best_quadF, best_diag
+
+    # ── Post-processing chain ────────────────────────────────────────────
+    if quadF.ndim == 2 and quadF.shape[1] == 4 and quadF.shape[0] > 0:
+        # P2: pull fold-over vertices toward quad centroid
+        quadV, n_repaired = _fix_foldover_quads(quadV, quadF)
+        if verbose and n_repaired > 0:
+            print(f"[miq_igl] fold-over post-fix: repaired {n_repaired} quads")
+        miq_diag['postfix_foldovers_repaired'] = n_repaired
+        miq_diag['stiffness_used'] = float(best_stiffness)
+
+        # Remove near-zero-area quads (degenerate "triangles" near singularities)
+        n_before = quadF.shape[0]
+        quadF = _remove_degenerate_quads(quadV, quadF)
+        n_degen = n_before - quadF.shape[0]
+        if verbose and n_degen > 0:
+            print(f"[miq_igl] removed {n_degen} degenerate quads")
+        miq_diag['degenerate_quads_removed'] = n_degen
+
+        # Prune to closed manifold subset — only if result keeps ≥50% of faces.
+        # (C++ MIQ may output open-boundary meshes; aggressive pruning can empty them.)
+        n_before = quadF.shape[0]
+        if n_before > 0:
+            candidate = _prune_quads_to_closed_manifold_subset(quadF)
+            if candidate.shape[0] >= 0.5 * n_before:
+                n_pruned = n_before - candidate.shape[0]
+                quadF = candidate
+                if verbose and n_pruned > 0:
+                    print(f"[miq_igl] manifold pruning removed {n_pruned} quads")
+                miq_diag['manifold_pruned_quads'] = n_pruned
+            else:
+                if verbose:
+                    print(f"[miq_igl] manifold pruning skipped "
+                          f"(would remove {n_before - candidate.shape[0]}/{n_before} quads)")
+                miq_diag['manifold_pruned_quads'] = 0
+
+        # Compact: remove orphan vertices
+        quadV, quadF = _compact_quad_mesh(quadV, quadF)
 
     if return_diagnostics:
         return quadV, quadF, miq_diag
@@ -856,6 +1061,7 @@ def miq_quadrangulate_igl(
 def initial_quad_mesh_from_pointcloud(
     points: np.ndarray,
     metric_field: np.ndarray,
+    metric_basis: Optional[np.ndarray] = None,
     guidance_confidence: Optional[np.ndarray] = None,
     guidance_override: Optional[np.ndarray] = None,
     guidance_override_weight: Optional[np.ndarray] = None,
@@ -879,13 +1085,19 @@ def initial_quad_mesh_from_pointcloud(
     igl_stiffness: float = 5.0,
     igl_direct_round: bool = True,
     igl_miq_iter: int = 5,
+    stiffness_schedule: Optional[Tuple[float, ...]] = None,
+    foldover_threshold: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Full pipeline:  Point cloud  →  Poisson mesh  →  Cross-field  →  Quad mesh.
 
     Args:
         points:             (N, 3) input point cloud.
-        metric_field:       (N, 2, 2) per-point metric tensors (in LCF 2D frame).
+        metric_field:       (N, 2, 2) per-point metric tensors. If metric_basis
+                            is supplied, tensors are interpreted in the input
+                            point LCF and reprojected into the reconstructed
+                            Poisson mesh frames before quadrangulation.
+        metric_basis:       Optional (N, 3, 3) input LCF basis from prediction.
         normals:            (N, 3) normals (estimated if None).
         poisson_depth:      Octree depth for Poisson reconstruction.
         gradient_size:      Controls quad density for the Python GL+param pipeline.
@@ -915,8 +1127,15 @@ def initial_quad_mesh_from_pointcloud(
     # 2. Tangent frames on the reconstructed mesh
     frames = compute_vertex_frames(V_tri, F_tri)
 
-    # 3. Transfer metric to mesh vertices
-    M_vert = _transfer_metric_to_mesh(points, metric_field, V_tri)
+    # 3. Transfer metric to mesh vertices.  Point predictions live in the input
+    # LCF, while Poisson reconstruction creates new vertex frames.  Lift to a
+    # world tensor first, transfer, then reproject into the Poisson frames.
+    if metric_basis is not None:
+        metric_world = _lift_lcf_metric_to_world(metric_field, metric_basis)
+        metric_world_vert = _transfer_metric_to_mesh(points, metric_world, V_tri)
+        M_vert = _project_world_metric_to_frames(metric_world_vert, frames)
+    else:
+        M_vert = _transfer_metric_to_mesh(points, metric_field, V_tri)
     conf_vert = None
     if guidance_confidence is not None:
         conf_vert = _transfer_scalar_to_mesh(
@@ -956,6 +1175,8 @@ def initial_quad_mesh_from_pointcloud(
             direct_round=bool(igl_direct_round),
             miq_iter=int(igl_miq_iter),
             binary_path=igl_binary_path,
+            stiffness_schedule=stiffness_schedule,
+            foldover_threshold=int(foldover_threshold),
             return_diagnostics=return_diagnostics,
         )
         if return_diagnostics:
@@ -1048,6 +1269,8 @@ def initial_quad_mesh_from_mesh(
     igl_stiffness: float = 5.0,
     igl_direct_round: bool = True,
     igl_miq_iter: int = 5,
+    stiffness_schedule: Optional[Tuple[float, ...]] = None,
+    foldover_threshold: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Mesh-input variant of the quadrangulation pipeline.
@@ -1110,6 +1333,8 @@ def initial_quad_mesh_from_mesh(
             direct_round=bool(igl_direct_round),
             miq_iter=int(igl_miq_iter),
             binary_path=igl_binary_path,
+            stiffness_schedule=stiffness_schedule,
+            foldover_threshold=foldover_threshold,
             return_diagnostics=return_diagnostics,
         )
         if return_diagnostics:

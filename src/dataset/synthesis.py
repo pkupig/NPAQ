@@ -7,6 +7,8 @@ Returns GLOBAL 3x3 metric tensors based on curvature.
 from __future__ import annotations
 
 import numpy as np
+from scipy import sparse
+from scipy.sparse.linalg import spsolve
 from typing import Tuple, Callable, Optional
 from dataclasses import dataclass
 
@@ -15,15 +17,22 @@ from dataclasses import dataclass
 class SurfaceSpec:
     """Specification of an analytic surface."""
     name: str
-    func: Callable[[np.ndarray, np.ndarray], np.ndarray]  # maps (u,v) to (x,y,z)
-    # Returns (N, 3, 3) global metric tensor based on curvature
-    metric_tensor: Callable[[np.ndarray, np.ndarray], np.ndarray]
-    principal_dirs: Callable[[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]
-    # Returns (N, 3) outward unit normals — used as extra model input features
-    normals_fn: Callable[[np.ndarray, np.ndarray], np.ndarray] = None
-    # Parameter domain bounds; surfaces with unbounded curvature falloff need a finite range
+    func: Callable[..., np.ndarray]            # (u, v, **params) -> (N, 3)
+    metric_tensor: Callable[..., np.ndarray]   # (u, v, **params) -> (N, 3, 3)
+    principal_dirs: Callable[..., Tuple[np.ndarray, np.ndarray]]
+    normals_fn: Callable[..., np.ndarray] = None
     u_range: Tuple[float, float] = (0.0, 2 * np.pi)
     v_range: Tuple[float, float] = (0.0, 2 * np.pi)
+    periodic_u: bool = False
+    periodic_v: bool = False
+    query_margin_frac: float = 0.15
+    patch_half_u: float = np.pi / 3
+    patch_half_v: float = 1.0
+    # Optional per-sample parameter randomiser. When set, SyntheticDataset draws
+    # fresh params (e.g. monge coefficients, bump amplitude) per __getitem__ call
+    # and forwards them as **kwargs to func / metric_tensor / principal_dirs /
+    # normals_fn. Surfaces with no random DoF leave this as None.
+    param_sampler: Optional[Callable[[np.random.RandomState], dict]] = None
 
 
 def construct_target_metric(
@@ -48,6 +57,9 @@ def construct_target_metric(
     d2_outer = dir2[:, :, None] * dir2[:, None, :]
     
     M = w1[:, None, None] * d1_outer + w2[:, None, None] * d2_outer
+    # Add isotropic floor to prevent any direction from having zero metric weight.
+    # This avoids log(0) explosions in Log-Euclidean loss on flat regions (e.g. cylinder axis).
+    M = M + 0.01 * np.eye(3)
     return M
 
 
@@ -426,61 +438,313 @@ def box_metric(u: np.ndarray, v: np.ndarray) -> np.ndarray:
     return construct_target_metric(d1, d2, k1, k2, epsilon=0.05)
 
 
+# ---------------------------------------------------------------------------
+# Generic Monge-form helper:  z = f(x, y)
+# All three new shape families (plane, gaussian_bump, monge_patch) plug into
+# this — any surface expressible as a height function over the xy-plane gets
+# correct II + principal directions for free.
+# ---------------------------------------------------------------------------
+
+def _monge_geometry(u, v, fx, fy, fxx, fxy, fyy):
+    """
+    Return (k1, k2, d1, d2, n) for a Monge patch z = f(x, y) given its
+    first/second partials evaluated at (u=x, v=y).
+
+    All inputs are (N,) arrays; outputs are (N,)/(N,3) arrays.
+    """
+    n_norm = np.sqrt(1.0 + fx ** 2 + fy ** 2)
+    inv_n = 1.0 / n_norm
+    # Tangent basis & normal
+    xu = np.stack([np.ones_like(u), np.zeros_like(u), fx], axis=-1)
+    xv = np.stack([np.zeros_like(u), np.ones_like(u), fy], axis=-1)
+    n = np.stack([-fx, -fy, np.ones_like(u)], axis=-1) * inv_n[..., None]
+    # First fundamental form
+    E = 1.0 + fx ** 2
+    F_coef = fx * fy
+    G = 1.0 + fy ** 2
+    # Second fundamental form
+    L = fxx * inv_n
+    M = fxy * inv_n
+    N = fyy * inv_n
+    # Principal curvatures
+    denom = E * G - F_coef ** 2 + 1e-12
+    K = (L * N - M ** 2) / denom
+    H = (E * N + G * L - 2.0 * F_coef * M) / (2.0 * denom)
+    disc = np.sqrt(np.maximum(H ** 2 - K, 0.0))
+    k1 = H + disc
+    k2 = H - disc
+    # Principal direction for k1 in tangent plane:  d1_uv = (M - k1·F, -(L - k1·E))
+    d1_u = M - k1 * F_coef
+    d1_v = -(L - k1 * E)
+    d1 = d1_u[..., None] * xu + d1_v[..., None] * xv
+    norm1 = np.linalg.norm(d1, axis=-1, keepdims=True) + 1e-12
+    d1 = d1 / norm1
+    d2 = np.cross(n, d1)
+    return k1, k2, d1, d2, n
+
+
+# ---------------------------------------------------------------------------
+# Plane (κ→0 coverage)
+# ---------------------------------------------------------------------------
+
+def plane_surface(u, v, **_):
+    return np.stack([u, v, np.zeros_like(u)], axis=-1)
+
+
+def plane_normals(u, v, **_):
+    n = np.zeros((len(u), 3))
+    n[:, 2] = 1.0
+    return n
+
+
+def plane_principal_dirs(u, v, **_):
+    d1 = np.zeros((len(u), 3)); d1[:, 0] = 1.0
+    d2 = np.zeros((len(u), 3)); d2[:, 1] = 1.0
+    return d1, d2
+
+
+def plane_metric(u, v, **_):
+    d1, d2 = plane_principal_dirs(u, v)
+    z = np.zeros_like(u)
+    return construct_target_metric(d1, d2, z, z, epsilon=0.1)
+
+
+# ---------------------------------------------------------------------------
+# Gaussian bump:  z = h · exp(-(x² + y²) / (2 σ²))
+# Smoothly varying κ, mostly elliptic at peak, hyperbolic on the rim.
+# ---------------------------------------------------------------------------
+
+def gaussian_bump_surface(u, v, h=0.6, sigma=0.5, **_):
+    r2 = u ** 2 + v ** 2
+    z = h * np.exp(-r2 / (2.0 * sigma ** 2))
+    return np.stack([u, v, z], axis=-1)
+
+
+def _gaussian_bump_partials(u, v, h, sigma):
+    s2 = sigma ** 2
+    e = np.exp(-(u ** 2 + v ** 2) / (2.0 * s2))
+    fx = -h * u / s2 * e
+    fy = -h * v / s2 * e
+    fxx = h * e * (u ** 2 / s2 - 1.0) / s2
+    fyy = h * e * (v ** 2 / s2 - 1.0) / s2
+    fxy = h * e * (u * v) / (s2 ** 2)
+    return fx, fy, fxx, fxy, fyy
+
+
+def gaussian_bump_normals(u, v, h=0.6, sigma=0.5, **_):
+    fx, fy, *_rest = _gaussian_bump_partials(u, v, h, sigma)
+    n = np.stack([-fx, -fy, np.ones_like(u)], axis=-1)
+    return n / (np.linalg.norm(n, axis=-1, keepdims=True) + 1e-12)
+
+
+def gaussian_bump_principal_dirs(u, v, h=0.6, sigma=0.5, **_):
+    fx, fy, fxx, fxy, fyy = _gaussian_bump_partials(u, v, h, sigma)
+    _, _, d1, d2, _ = _monge_geometry(u, v, fx, fy, fxx, fxy, fyy)
+    return d1, d2
+
+
+def gaussian_bump_metric(u, v, h=0.6, sigma=0.5, **_):
+    fx, fy, fxx, fxy, fyy = _gaussian_bump_partials(u, v, h, sigma)
+    k1, k2, d1, d2, _ = _monge_geometry(u, v, fx, fy, fxx, fxy, fyy)
+    return construct_target_metric(d1, d2, k1, k2)
+
+
+def gaussian_bump_param_sampler(rng):
+    return {
+        'h':     float(rng.uniform(0.3, 1.0)),
+        'sigma': float(rng.uniform(0.35, 0.7)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Random Monge quadric:  z = a x² + b xy + c y²
+# (a, b, c) drawn per-sample → covers the entire (κ1, κ2) ∈ ℝ² plane:
+#   elliptic (a·c > 0, b small), hyperbolic (a·c < 0), parabolic (det ≈ 0),
+#   isotropic (a = c, b = 0), arbitrary skew.
+# This is the killer addition for II_x manifold coverage.
+# ---------------------------------------------------------------------------
+
+def monge_patch_surface(u, v, a=0.5, b=0.0, c=-0.3, **_):
+    z = a * u ** 2 + b * u * v + c * v ** 2
+    return np.stack([u, v, z], axis=-1)
+
+
+def _monge_patch_partials(u, v, a, b, c):
+    fx = 2.0 * a * u + b * v
+    fy = b * u + 2.0 * c * v
+    fxx = np.full_like(u, 2.0 * a)
+    fxy = np.full_like(u, b)
+    fyy = np.full_like(u, 2.0 * c)
+    return fx, fy, fxx, fxy, fyy
+
+
+def monge_patch_normals(u, v, a=0.5, b=0.0, c=-0.3, **_):
+    fx, fy, *_rest = _monge_patch_partials(u, v, a, b, c)
+    n = np.stack([-fx, -fy, np.ones_like(u)], axis=-1)
+    return n / (np.linalg.norm(n, axis=-1, keepdims=True) + 1e-12)
+
+
+def monge_patch_principal_dirs(u, v, a=0.5, b=0.0, c=-0.3, **_):
+    fx, fy, fxx, fxy, fyy = _monge_patch_partials(u, v, a, b, c)
+    _, _, d1, d2, _ = _monge_geometry(u, v, fx, fy, fxx, fxy, fyy)
+    return d1, d2
+
+
+def monge_patch_metric(u, v, a=0.5, b=0.0, c=-0.3, **_):
+    fx, fy, fxx, fxy, fyy = _monge_patch_partials(u, v, a, b, c)
+    k1, k2, d1, d2, _ = _monge_geometry(u, v, fx, fy, fxx, fxy, fyy)
+    return construct_target_metric(d1, d2, k1, k2)
+
+
+def monge_patch_param_sampler(rng):
+    # Sample (a, b, c) with controlled magnitude — cover the full
+    # (elliptic, hyperbolic, parabolic, near-flat) curvature plane.
+    sign = rng.choice([-1.0, 1.0], size=3)
+    mag = rng.uniform(0.0, 1.5, size=3)
+    a, b, c = sign * mag
+    return {'a': float(a), 'b': float(b), 'c': float(c)}
+
+
+# ---------------------------------------------------------------------------
+# Add **_ kwargs catch-all to existing surface functions so SyntheticDataset
+# can uniformly forward param dicts (most existing surfaces ignore them).
+# ---------------------------------------------------------------------------
+
+def _wrap_ignore_kwargs(fn):
+    def wrapped(*args, **_kwargs):
+        return fn(*args)
+    wrapped.__name__ = fn.__name__
+    return wrapped
+
+
 # Register available surfaces
+# periodic_u/v=True  → parameter wraps around, no real boundary edge.
+# periodic_u/v=False → open boundary; query points near the edge have one-sided
+#                      kNN neighbourhoods and are excluded from query selection.
 SURFACES = {
     'cylinder': SurfaceSpec(
         name='cylinder',
-        func=cylinder_surface,
-        metric_tensor=cylinder_metric,
-        principal_dirs=cylinder_principal_dirs,
-        normals_fn=cylinder_normals,
+        func=_wrap_ignore_kwargs(cylinder_surface),
+        metric_tensor=_wrap_ignore_kwargs(cylinder_metric),
+        principal_dirs=_wrap_ignore_kwargs(cylinder_principal_dirs),
+        normals_fn=_wrap_ignore_kwargs(cylinder_normals),
         u_range=(0.0, 2 * np.pi),
         v_range=(-np.pi, np.pi),
+        periodic_u=True,   # circumferential direction wraps
+        periodic_v=False,  # axial direction has open ends
+        # 60° arc (chord=1.0 for R=1) × 1.2 axial units — stays on one "side"
+        patch_half_u=np.pi / 3,
+        patch_half_v=1.2,
     ),
     'torus': SurfaceSpec(
         name='torus',
-        func=torus_surface,
-        metric_tensor=torus_metric,
-        principal_dirs=torus_principal_dirs,
-        normals_fn=torus_normals,
+        func=_wrap_ignore_kwargs(torus_surface),
+        metric_tensor=_wrap_ignore_kwargs(torus_metric),
+        principal_dirs=_wrap_ignore_kwargs(torus_principal_dirs),
+        normals_fn=_wrap_ignore_kwargs(torus_normals),
         u_range=(0.0, 2 * np.pi),
         v_range=(0.0, 2 * np.pi),
+        periodic_u=True,   # both directions wrap — fully closed genus-1 surface
+        periodic_v=True,
+        # 45° on major circle (chord≈1.5 for R=2) × 60° on minor circle (chord≈1.0 for r=1)
+        patch_half_u=np.pi / 4,
+        patch_half_v=np.pi / 3,
     ),
     'saddle': SurfaceSpec(
         name='saddle',
-        func=saddle_surface,
-        metric_tensor=saddle_metric,
-        principal_dirs=saddle_principal_dirs,
-        normals_fn=saddle_normals,
+        func=_wrap_ignore_kwargs(saddle_surface),
+        metric_tensor=_wrap_ignore_kwargs(saddle_metric),
+        principal_dirs=_wrap_ignore_kwargs(saddle_principal_dirs),
+        normals_fn=_wrap_ignore_kwargs(saddle_normals),
         u_range=(-2.0, 2.0),
         v_range=(-2.0, 2.0),
+        periodic_u=False,  # finite patch; all four edges are open boundaries
+        periodic_v=False,
+        # 30% of full range — local enough that geodesic ≈ Euclidean
+        patch_half_u=1.2,
+        patch_half_v=1.2,
     ),
     'sphere': SurfaceSpec(
         name='sphere',
-        func=sphere_surface,
-        metric_tensor=sphere_metric,
-        principal_dirs=sphere_principal_dirs,
-        normals_fn=sphere_normals,
+        func=_wrap_ignore_kwargs(sphere_surface),
+        metric_tensor=_wrap_ignore_kwargs(sphere_metric),
+        principal_dirs=_wrap_ignore_kwargs(sphere_principal_dirs),
+        normals_fn=_wrap_ignore_kwargs(sphere_normals),
         u_range=(0.0, 2 * np.pi),
         v_range=(0.15, np.pi - 0.15),
+        periodic_u=True,   # longitude wraps
+        periodic_v=False,  # colatitude is bounded (poles already excluded by v_range)
+        patch_half_u=np.pi / 3,
+        patch_half_v=np.pi / 4,
     ),
     'ellipsoid': SurfaceSpec(
         name='ellipsoid',
-        func=ellipsoid_surface,
-        metric_tensor=ellipsoid_metric,
-        principal_dirs=ellipsoid_principal_dirs,
-        normals_fn=ellipsoid_normals,
+        func=_wrap_ignore_kwargs(ellipsoid_surface),
+        metric_tensor=_wrap_ignore_kwargs(ellipsoid_metric),
+        principal_dirs=_wrap_ignore_kwargs(ellipsoid_principal_dirs),
+        normals_fn=_wrap_ignore_kwargs(ellipsoid_normals),
         u_range=(0.0, 2 * np.pi),
         v_range=(0.15, np.pi - 0.15),
+        periodic_u=True,   # longitude wraps
+        periodic_v=False,  # colatitude bounded
+        # Smaller window: major axis a=2 means the same δu covers more 3D distance
+        patch_half_u=np.pi / 4,
+        patch_half_v=np.pi / 4,
     ),
     'box': SurfaceSpec(
         name='box',
-        func=box_surface,
-        metric_tensor=box_metric,
-        principal_dirs=box_principal_dirs,
-        normals_fn=box_normals,
+        func=_wrap_ignore_kwargs(box_surface),
+        metric_tensor=_wrap_ignore_kwargs(box_metric),
+        principal_dirs=_wrap_ignore_kwargs(box_principal_dirs),
+        normals_fn=_wrap_ignore_kwargs(box_normals),
         u_range=(0.0, 6.0),
         v_range=(-1.0, 1.0),
+        periodic_u=False,
+        periodic_v=False,
+        patch_half_u=0.14,
+        patch_half_v=0.65,
+    ),
+    # ── New: distribution-coverage shapes (extend supp(D_syn) on II_x manifold) ──
+    'plane': SurfaceSpec(
+        name='plane',
+        func=plane_surface,
+        metric_tensor=plane_metric,
+        principal_dirs=plane_principal_dirs,
+        normals_fn=plane_normals,
+        u_range=(-1.0, 1.0),
+        v_range=(-1.0, 1.0),
+        periodic_u=False,
+        periodic_v=False,
+        patch_half_u=0.3,
+        patch_half_v=0.3,
+    ),
+    'gaussian_bump': SurfaceSpec(
+        name='gaussian_bump',
+        func=gaussian_bump_surface,
+        metric_tensor=gaussian_bump_metric,
+        principal_dirs=gaussian_bump_principal_dirs,
+        normals_fn=gaussian_bump_normals,
+        u_range=(-1.0, 1.0),
+        v_range=(-1.0, 1.0),
+        periodic_u=False,
+        periodic_v=False,
+        patch_half_u=0.4,
+        patch_half_v=0.4,
+        param_sampler=gaussian_bump_param_sampler,
+    ),
+    'monge_patch': SurfaceSpec(
+        name='monge_patch',
+        func=monge_patch_surface,
+        metric_tensor=monge_patch_metric,
+        principal_dirs=monge_patch_principal_dirs,
+        normals_fn=monge_patch_normals,
+        u_range=(-0.5, 0.5),
+        v_range=(-0.5, 0.5),
+        periodic_u=False,
+        periodic_v=False,
+        patch_half_u=0.18,
+        patch_half_v=0.18,
+        param_sampler=monge_patch_param_sampler,
     ),
 }
 
@@ -491,11 +755,17 @@ def sample_surface(
     u_range: Optional[Tuple[float, float]] = None,
     v_range: Optional[Tuple[float, float]] = None,
     noise_std: float = 0.0,
+    rng: Optional[np.random.RandomState] = None,
     seed: Optional[int] = None,
+    smooth_lambda: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray]:
     """
     Sample points and compute 3x3 GLOBAL metric tensors.
     u_range/v_range default to the range stored in spec (per-surface override).
+
+    Pass ``rng`` (a RandomState instance) for isolated randomness; ``seed`` is
+    a fallback that creates a fresh local RandomState — neither path touches the
+    global np.random state.
 
     Returns:
         points:   (N, 3) 3D positions (possibly noisy)
@@ -505,16 +775,16 @@ def sample_surface(
         normals:  (N, 3) outward unit surface normals, or None if normals_fn not set
         params:   (N, 2) (u, v) parameter values
     """
-    if seed is not None:
-        np.random.seed(seed)
+    if rng is None:
+        rng = np.random.RandomState(seed)  # local state — does not touch np.random global
 
     # Use per-surface range unless caller overrides
     u_range = u_range if u_range is not None else spec.u_range
     v_range = v_range if v_range is not None else spec.v_range
 
     # Sample parameters uniformly
-    u = np.random.uniform(u_range[0], u_range[1], n_points)
-    v = np.random.uniform(v_range[0], v_range[1], n_points)
+    u = rng.uniform(u_range[0], u_range[1], n_points)
+    v = rng.uniform(v_range[0], v_range[1], n_points)
 
     # Compute points
     points = spec.func(u, v)  # (n_points, 3)
@@ -524,10 +794,27 @@ def sample_surface(
 
     # Add noise if requested
     if noise_std > 0:
-        points += np.random.normal(0, noise_std, points.shape)
+        points += rng.normal(0, noise_std, points.shape)
 
     # Compute metric tensors (N, 3, 3)
     metric = spec.metric_tensor(u, v)
+
+    # Smooth GT metric field to reduce hard discontinuities at surface boundaries
+    # (e.g. cylinder k1=0 vs torus k1>0 jump).  Uses implicit Laplacian diffusion
+    # (I + λL) M_new = M on the kNN graph of the generated point cloud.
+    if smooth_lambda > 0.0 and n_points > 1:
+        from src.geometry.laplacian import build_point_cloud_laplacian
+        L = build_point_cloud_laplacian(points, k=min(10, n_points - 1))
+        N_pts = n_points
+        I_sp = sparse.identity(N_pts, format='csr')
+        A = I_sp + smooth_lambda * L
+        metric_flat = metric.reshape(N_pts, 9)
+        metric_smooth = np.zeros_like(metric_flat)
+        for c in range(9):
+            metric_smooth[:, c] = spsolve(A, metric_flat[:, c])
+        metric = metric_smooth.reshape(N_pts, 3, 3)
+        # Re-enforce symmetry after smoothing
+        metric = 0.5 * (metric + metric.transpose(0, 2, 1))
 
     # Compute principal directions (unit vectors)
     dir1, dir2 = spec.principal_dirs(u, v)
@@ -555,14 +842,14 @@ def generate_mixed_synthetic_dataset(
     """
     if proportions is None:
         proportions = {'cylinder': 1./3, 'torus': 1./3, 'saddle': 1./3}
-    np.random.seed(seed)
+    local_rng = np.random.RandomState(seed)
     points_list, metrics_list, dir1_list, dir2_list, labels_list = [], [], [], [], []
     for name, frac in proportions.items():
         n = int(round(n_total * frac))
         if n == 0:
             continue
         spec = SURFACES[name]
-        p, m, d1, d2, _normals, _ = sample_surface(spec, n, noise_std=noise_std, seed=np.random.randint(1e6))
+        p, m, d1, d2, _normals, _ = sample_surface(spec, n, noise_std=noise_std, rng=local_rng)
         points_list.append(p)
         metrics_list.append(m)
         dir1_list.append(d1)

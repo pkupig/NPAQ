@@ -11,3 +11,6 @@
 *.txt
 /cpp_miq/build
 .polyscope.ini
+__pycache__/
+*.py[cod]
+.codex

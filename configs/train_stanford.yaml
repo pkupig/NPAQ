@@ -1,0 +1,35 @@
+data:
+  type: stanford
+  root_dir: data/stanford_preprocessed
+  k_neighbors: 32
+  noise_std: 0.003
+  cache: true
+  use_normal: true
+
+model:
+  k: 20
+  emb_dims: 256
+  dropout: 0.2
+  in_dims: 6
+  max_log_half: 1.5
+  predict_confidence: true
+
+loss:
+  lambda_aniso: 0.1
+  lambda_conf:  0.1   # directional-saliency supervision (legacy field name: confidence)
+  lambda_topo:  0.01
+  lambda_j:     0.0   # optional unrolled PD loss; current train.py fails fast if >0
+  topo_det_eps:  1.0e-3
+  topo_cond_max: 50.0
+
+training:
+  batch_size: 32             # only 22 meshes → fewer patches per epoch
+  epochs: 150
+  lr: 0.0003
+  weight_decay: 1.0e-5
+  lr_scheduler: step
+  lr_decay_step: 30
+  lr_decay_gamma: 0.5
+  num_workers: 0
+  mixed_precision: false
+  checkpoint_dir: ./checkpoints_stanford

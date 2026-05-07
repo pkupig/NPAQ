@@ -32,7 +32,7 @@ import traceback
 from pathlib import Path
 
 import numpy as np
-from sklearn.neighbors import KDTree
+from scipy.spatial import KDTree
 from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -51,76 +51,156 @@ def _estimate_principal_curvature(
     epsilon: float = 0.05,
 ):
     """
-    Estimate principal curvatures k1, k2 and directions d1, d2 at every point
-    by fitting a local quadratic height-function patch in the tangent plane.
+    Vectorised principal curvature estimation via the Weingarten map
+    (shape operator from normal variations).
+
+    Replaces the old height-function quadratic fitting loop with a fully
+    vectorised numpy implementation that:
+      1. Uses Duff et al. (2017) stable tangent frames — consistent with
+         crossfield.py and _build_2d_metric (eliminates frame discontinuities).
+      2. Fits the shape operator W = [[a,b],[b,c]] via normal variation:
+             W · [ex, ey]^T = -[dnx, dny]^T  (Weingarten map)
+         This uses the full normal field, not just the scalar height, giving
+         better accuracy for clean meshes (e.g. Stanford models).
+      3. No Python loop — O(N·k) vectorised normal equations.
 
     Returns:
-        k1, k2: (N,) principal curvatures (|k1| >= |k2|)
-        d1, d2: (N,3) principal directions (unit, in 3D)
+        k1, k2: (N,) principal curvatures  (|k1| ≥ |k2| on average)
+        d1, d2: (N,3) unit principal directions in 3D
     """
     N = len(points)
     tree = KDTree(points)
-    _, idx = tree.query(points, k=k + 1)   # k+1 because the point itself is included
-    idx = idx[:, 1:]                        # exclude self, shape (N, k)
+    _, idx = tree.query(points, k=k + 1)
+    idx = idx[:, 1:]   # (N, k) — exclude self
 
-    k1_arr = np.zeros(N)
-    k2_arr = np.zeros(N)
-    d1_arr = np.zeros((N, 3))
-    d2_arr = np.zeros((N, 3))
+    nv = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-12)
 
-    for i in range(N):
-        n = normals[i]
-        n = n / (np.linalg.norm(n) + 1e-12)
+    # ── Duff et al. (2017) stable tangent frames ──────────────────────────
+    nx, ny, nz = nv[:, 0], nv[:, 1], nv[:, 2]
+    sg = np.where(nz >= 0.0, 1.0, -1.0)
+    av = -1.0 / (sg + nz)
+    bv = nx * ny * av
+    e1 = np.stack([1.0 + sg*nx**2*av,  sg*bv,        -sg*nx], axis=1)  # (N, 3)
+    e2 = np.stack([bv,                  sg + ny**2*av, -ny  ], axis=1)  # (N, 3)
+    e1 /= (np.linalg.norm(e1, axis=1, keepdims=True) + 1e-12)
+    e2 /= (np.linalg.norm(e2, axis=1, keepdims=True) + 1e-12)
 
-        # Build orthonormal tangent frame {e1, e2} at p
-        # Pick any vector not parallel to n
-        if abs(n[0]) < 0.9:
-            tmp = np.array([1.0, 0.0, 0.0])
-        else:
-            tmp = np.array([0.0, 1.0, 0.0])
-        e1 = tmp - np.dot(tmp, n) * n
-        e1 /= (np.linalg.norm(e1) + 1e-12)
-        e2 = np.cross(n, e1)
-        e2 /= (np.linalg.norm(e2) + 1e-12)
+    # ── Gather neighbor data ──────────────────────────────────────────────
+    neigh_pts = points[idx]   # (N, k, 3)
+    neigh_nrm = nv[idx]       # (N, k, 3)
 
-        # Neighbors projected onto tangent plane
-        neighbors = points[idx[i]]  # (k, 3)
-        diffs = neighbors - points[i]
-        u = diffs @ e1   # (k,)
-        v = diffs @ e2   # (k,)
-        h = diffs @ n    # (k,) height above tangent plane
+    ni_exp = nv[:, None, :]   # (N, 1, 3)
 
-        # Fit quadratic: h = a*u^2 + b*u*v + c*v^2
-        # Design matrix A, solve A @ [a,b,c]^T = h in least-squares sense
-        A = np.stack([u**2, u * v, v**2], axis=1)   # (k, 3)
-        try:
-            coeffs, _, _, _ = np.linalg.lstsq(A, h, rcond=None)   # [a, b, c]
-        except np.linalg.LinAlgError:
-            continue
-        a, b, c = coeffs
+    # Edge vectors projected to tangent plane
+    edge = neigh_pts - points[:, None, :]                                # (N, k, 3)
+    edge_t = edge - (edge * ni_exp).sum(-1, keepdims=True) * ni_exp     # (N, k, 3)
+    et_len = np.linalg.norm(edge_t, axis=-1) + 1e-12                    # (N, k)
 
-        # Second fundamental form (shape operator in {e1,e2} basis)
-        II = np.array([[2*a, b], [b, 2*c]])
+    # Normalised edge direction in tangent frame
+    ex = (edge_t * e1[:, None, :]).sum(-1) / et_len   # (N, k)
+    ey = (edge_t * e2[:, None, :]).sum(-1) / et_len   # (N, k)
 
-        # Principal curvatures and directions in tangent plane
-        eigvals, eigvecs = np.linalg.eigh(II)   # ascending order
-        # eigvals[1] >= eigvals[0]; use absolute values for anisotropy weighting
-        k2_i, k1_i = eigvals[0], eigvals[1]     # k1: larger |eigenvalue|
+    # Normal variation: dn_t / edge_len  (shape operator estimate)
+    dn   = neigh_nrm - nv[:, None, :]                                    # (N, k, 3)
+    dn_t = dn - (dn * ni_exp).sum(-1, keepdims=True) * ni_exp           # (N, k, 3)
+    dnx  = (dn_t * e1[:, None, :]).sum(-1) / et_len                     # (N, k)
+    dny  = (dn_t * e2[:, None, :]).sum(-1) / et_len                     # (N, k)
 
-        # Map 2D eigenvectors back to 3D
-        ev1 = eigvecs[:, 1]   # corresponds to k1
-        ev2 = eigvecs[:, 0]   # corresponds to k2
-        d1_3d = ev1[0] * e1 + ev1[1] * e2
-        d2_3d = ev2[0] * e1 + ev2[1] * e2
-        d1_3d /= (np.linalg.norm(d1_3d) + 1e-12)
-        d2_3d /= (np.linalg.norm(d2_3d) + 1e-12)
+    # ── Normal equations for W = [[a,b],[b,c]] ───────────────────────────
+    # Per-neighbor design rows: [ex, ey, 0] and [0, ex, ey]
+    # A^T A = [[Σex²,       Σex·ey,          0      ],
+    #          [Σex·ey,     Σ(ex²+ey²),      Σex·ey ],
+    #          [0,          Σex·ey,           Σey²   ]]
+    # A^T b = [-Σex·dnx,  -(Σey·dnx + Σex·dny),  -Σey·dny]
+    Su2 = (ex * ex).sum(-1)   # (N,)
+    Sv2 = (ey * ey).sum(-1)   # (N,)
+    Suv = (ex * ey).sum(-1)   # (N,)
+    z   = np.zeros(N)
 
-        k1_arr[i] = k1_i
-        k2_arr[i] = k2_i
-        d1_arr[i] = d1_3d
-        d2_arr[i] = d2_3d
+    ATA = np.stack([
+        np.stack([Su2,       Suv,        z        ], axis=-1),
+        np.stack([Suv,       Su2 + Sv2,  Suv      ], axis=-1),
+        np.stack([z,         Suv,        Sv2      ], axis=-1),
+    ], axis=-2)   # (N, 3, 3)
+
+    ATb = np.stack([
+        -(ex * dnx).sum(-1),
+        -((ey * dnx) + (ex * dny)).sum(-1),
+        -(ey * dny).sum(-1),
+    ], axis=-1)   # (N, 3)
+
+    # Solve (ridge regression for numerical stability)
+    reg = 1e-8 * np.eye(3, dtype=np.float64)
+    coeffs = np.linalg.solve(ATA.astype(np.float64) + reg,
+                              ATb.astype(np.float64))   # (N, 3)
+
+    a_c, b_c, c_c = coeffs[:, 0], coeffs[:, 1], coeffs[:, 2]
+
+    # ── Eigendecomposition of shape operator W ────────────────────────────
+    II = np.stack([
+        np.stack([a_c, b_c], axis=-1),
+        np.stack([b_c, c_c], axis=-1),
+    ], axis=-2)   # (N, 2, 2)
+
+    eigvals, eigvecs = np.linalg.eigh(II)   # (N, 2), (N, 2, 2); ascending
+
+    k1_arr = eigvals[:, 1]                  # max curvature
+    k2_arr = eigvals[:, 0]                  # min curvature
+
+    ev1 = eigvecs[:, :, 1]   # (N, 2) — eigenvector for k1
+    ev2 = eigvecs[:, :, 0]   # (N, 2) — eigenvector for k2
+
+    d1_arr = ev1[:, 0:1] * e1 + ev1[:, 1:2] * e2   # (N, 3)
+    d2_arr = ev2[:, 0:1] * e1 + ev2[:, 1:2] * e2   # (N, 3)
+    d1_arr /= (np.linalg.norm(d1_arr, axis=1, keepdims=True) + 1e-12)
+    d2_arr /= (np.linalg.norm(d2_arr, axis=1, keepdims=True) + 1e-12)
 
     return k1_arr, k2_arr, d1_arr, d2_arr
+
+
+def _smooth_direction_field(
+    d1: np.ndarray,
+    points: np.ndarray,
+    normals: np.ndarray,
+    k_smooth: int = 10,
+) -> np.ndarray:
+    """
+    Smooth a line-field d1 (N, 3) via tensor-voting / outer-product averaging.
+
+    For each point i:
+      1. Accumulate M_i = Σ_j d1[j] d1[j]^T over the k nearest neighbors.
+      2. Extract the principal eigenvector of M_i as the smoothed direction.
+      3. Re-project onto the tangent plane to ensure tangency.
+
+    The 180° ambiguity of d1 is handled automatically (outer products are
+    sign-invariant).
+
+    Returns:
+        d1_smooth: (N, 3) smoothed unit direction field.
+    """
+    N = len(points)
+    tree = KDTree(points)
+    _, idx = tree.query(points, k=k_smooth + 1)
+    idx = idx[:, 1:]   # (N, k_smooth)
+
+    # Outer products (N, 3, 3)
+    M = d1[:, :, None] * d1[:, None, :]   # (N, 3, 3)
+
+    # Average over KNN including self
+    M_neigh = M[idx]                      # (N, k_smooth, 3, 3)
+    M_self  = M[:, None, :, :]            # (N, 1, 3, 3)
+    M_avg   = np.concatenate([M_self, M_neigh], axis=1).mean(axis=1)  # (N, 3, 3)
+
+    # Extract principal eigenvector
+    _, eigvecs = np.linalg.eigh(M_avg)    # (N, 3), (N, 3, 3); ascending
+    d1_s = eigvecs[:, :, -1]              # (N, 3) — largest eigenvalue
+
+    # Re-project onto tangent plane
+    nv = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-12)
+    d1_s = d1_s - (d1_s * nv).sum(-1, keepdims=True) * nv
+    d1_s /= (np.linalg.norm(d1_s, axis=1, keepdims=True) + 1e-12)
+
+    return d1_s
 
 
 def _build_2d_metric(
@@ -154,7 +234,7 @@ def _build_2d_metric(
     # e3 = unit normal
     e3 = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-12)  # (N, 3)
 
-    # Build e1/e2 with Duff et al. (2017) smooth formula — same as compute_vertex_frames
+    # Build e1/e2 with Duff et al. (2017) stable ONB formula — same as compute_vertex_frames
     # and lcf.py (normals branch) so preprocessing and inference frames are identical.
     nx_v, ny_v, nz_v = e3[:, 0], e3[:, 1], e3[:, 2]
     sign_v = np.where(nz_v >= 0.0, 1.0, -1.0)
@@ -237,6 +317,17 @@ def process_file(
         return None
     pts = pts[valid]
 
+    # ── Normalise to unit bounding-box ───────────────────────────────────
+    # Curvature k ∝ 1/scale, so unnormalised meshes yield metric values
+    # that vary by orders of magnitude across shapes (e.g. armadillo: frob≈0.04,
+    # bunny2: frob≈5275 before fix).  Normalising here keeps all curvatures
+    # in a comparable range and prevents any single mesh from dominating training.
+    pts = pts.astype(np.float64)
+    pts -= pts.mean(axis=0)
+    bbox_diag = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0))) + 1e-12
+    pts /= bbox_diag
+    pts = pts.astype(np.float32)
+
     # Estimate normals (open3d fast path)
     try:
         import open3d as o3d
@@ -256,10 +347,30 @@ def process_file(
         from src.geometry.feature_lines import estimate_normals
         normals = estimate_normals(pts, k=k_fit).astype(np.float32)
 
-    # Principal curvature estimation
+    # Principal curvature estimation (vectorised shape operator)
     k1, k2, d1, d2 = _estimate_principal_curvature(
         pts, normals, k=k_fit, rho=rho, epsilon=epsilon
     )
+
+    # Post-smooth d1 to reduce high-frequency noise in principal directions.
+    # d2 is recomputed from d1 × n to preserve orthogonality.
+    nv_pts = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-12)
+    d1 = _smooth_direction_field(d1, pts, nv_pts, k_smooth=k_fit)
+    d2 = np.cross(nv_pts, d1)
+    d2 /= (np.linalg.norm(d2, axis=1, keepdims=True) + 1e-12)
+
+    # ── Normalise curvature scale ────────────────────────────────────────
+    # Stanford (and other real) meshes have curvatures 5-50× larger than
+    # synthetic shapes (cylinder k=1, sphere k=1) even after unit-bbox
+    # normalisation, because they have fine geometric detail.
+    # Scale k1, k2 so that the 95th-percentile |k| = 1 within each mesh.
+    # This keeps the ANISOTROPY RATIO (k1/k2) unchanged while mapping the
+    # absolute curvature magnitude to the same range as synthetic data,
+    # so that metric tensor Frobenius norms and the Log-Euclidean loss
+    # are directly comparable across dataset types.
+    k_ref = np.percentile(np.abs(np.concatenate([k1, k2])), 95) + 1e-6
+    k1 = k1 / k_ref
+    k2 = k2 / k_ref
 
     # 2D LCF metric tensors
     metric_2d, _ = _build_2d_metric(

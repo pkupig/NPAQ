@@ -70,8 +70,8 @@ def _neural_crossfield(V, F, frames, ckpt_path, k=20, device=None):
     import torch
     from scipy.spatial import KDTree
     from src.models.dgcnn import (
-        DGCNN, load_legacy_checkpoint, infer_in_dims_from_checkpoint,
-        infer_predict_singularity_from_checkpoint, infer_predict_confidence_from_checkpoint
+        DGCNN, infer_in_dims_from_checkpoint,
+        infer_predict_confidence_from_checkpoint,
     )
     from src.geometry.metric_utils import params_to_tensor
     from src.geometry.laplacian import smooth_metric_field_implicit
@@ -85,18 +85,12 @@ def _neural_crossfield(V, F, frames, ckpt_path, k=20, device=None):
     state = ckpt.get('model_state_dict', ckpt)
     k_nn  = mcfg.get('k', k)
     in_dims = infer_in_dims_from_checkpoint(state)
-    predict_singularity = infer_predict_singularity_from_checkpoint(state)
     predict_confidence = infer_predict_confidence_from_checkpoint(state)
-    try:
-        model = DGCNN(k=k_nn, emb_dims=mcfg.get('emb_dims', 256),
-                      dropout=mcfg.get('dropout', 0.5), in_dims=in_dims,
-                      predict_singularity=predict_singularity,
-                      predict_confidence=predict_confidence,
-                      max_log_half=mcfg.get('max_log_half', 1.5)).to(device)
-        model.load_state_dict(ckpt['model_state_dict'], strict=True)
-    except (KeyError, RuntimeError):
-        model = load_legacy_checkpoint(ckpt_path, device, k=k_nn,
-                                       emb_dims=256, dropout=0.5)
+    model = DGCNN(k=k_nn, emb_dims=mcfg.get('emb_dims', 256),
+                  dropout=mcfg.get('dropout', 0.5), in_dims=in_dims,
+                  predict_confidence=predict_confidence,
+                  max_log_half=mcfg.get('max_log_half', 1.5)).to(device)
+    model.load_state_dict(state, strict=True)
     model.eval()
     points = V
     N = len(points)

@@ -89,17 +89,17 @@ def compute_vertex_frames(
     else:
         vn = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-10)
 
-    # Build a smooth, everywhere-defined tangent frame using the
+    # Build a deterministic, numerically stable tangent frame using the
     # Duff et al. (2017) "Building an Orthonormal Basis, Revisited" formula.
     #
     # The old helper-axis approach (cross with X or Y, switching at |n_x|=0.9)
-    # creates a discontinuity line on the mesh.  Vertices straddling that line
+    # creates an artificial switch line on the mesh.  Vertices straddling that line
     # receive frames that differ by ~45°, inflating the parallel-transport
     # angles in build_connection_laplacian and producing spurious singularities
     # that force excessive mesh cuts → UV fragmentation → too few quads.
     #
-    # The Duff et al. formula is C¹ smooth for all normals with nz ≠ -(nz+1)
-    # (i.e. |n| > 0, which is always true for unit normals).
+    # The Duff et al. formula avoids the helper-axis branch singularity; a
+    # global smooth tangent frame still cannot exist on arbitrary closed meshes.
     nx, ny, nz = vn[:, 0], vn[:, 1], vn[:, 2]
     sign = np.where(nz >= 0.0, 1.0, -1.0)          # never zero
     a    = -1.0 / (sign + nz)                        # denominator ≥ 1 in abs
@@ -854,7 +854,13 @@ def solve_crossfield_gl(
                     0.85 * singularity_override_weight[use_sing],
                 )
 
-    reliability = aniso * conf
+    # Directional saliency controls how strongly the GL solve follows neural
+    # guidance.  With a saliency head available, combine it with the current
+    # metric anisotropy as two estimates of whether the principal direction is
+    # meaningful.  The geometric mean preserves the q scale when both estimates
+    # agree (sqrt(q*q)=q), while suppressing unreliable directions if either the
+    # head or the metric itself says the region is near-isotropic.
+    reliability = np.sqrt(np.clip(aniso * conf, 0.0, 1.0)) if guidance_confidence is not None else aniso
     anchor_mask = reliability >= float(anisotropy_eps)
     if np.any(override_active):
         floor = float(np.clip(guidance_override_reliability_floor, 0.0, 1.0))
@@ -1114,6 +1120,17 @@ def euler_characteristic(V: np.ndarray, F: np.ndarray) -> int:
     return len(V) - len(edges) + len(F)
 
 
+def count_boundary_edges(F: np.ndarray) -> int:
+    """Count edges incident to exactly one triangle."""
+    edge_counts: dict[tuple[int, int], int] = {}
+    for f in F:
+        for k in range(3):
+            a, b = int(f[k]), int(f[(k + 1) % 3])
+            key = (min(a, b), max(a, b))
+            edge_counts[key] = edge_counts.get(key, 0) + 1
+    return int(sum(1 for count in edge_counts.values() if count == 1))
+
+
 def verify_poincare_hopf(
     V: np.ndarray,
     F: np.ndarray,
@@ -1139,10 +1156,29 @@ def verify_poincare_hopf(
     """
     sing = detect_singularities_from_crossfield(V, F, u, frames=frames, tol=tol)
     chi = euler_characteristic(V, F)
+    boundary_edges = count_boundary_edges(F)
     if 'vertex_indices' in sing and len(sing['vertex_indices']) > 0:
         sum_idx = float(np.asarray(sing['vertex_indices'], dtype=np.float64).sum())
     else:
         sum_idx = float(sing['indices'].sum()) if len(sing['indices']) > 0 else 0.0
+
+    if boundary_edges > 0:
+        rec = (
+            "Strict P-H check skipped for open mesh: boundary contribution is "
+            f"not modelled ({boundary_edges} boundary edges)."
+        )
+        return {
+            'chi': chi,
+            'sum_index': sum_idx,
+            'satisfied': True,
+            'strict': False,
+            'closed': False,
+            'boundary_edges': boundary_edges,
+            'deficit': 0.0,
+            'singularities': sing,
+            'recommendation': rec,
+        }
+
     deficit = sum_idx - float(chi)
     satisfied = abs(deficit) < 0.3
 
@@ -1161,6 +1197,9 @@ def verify_poincare_hopf(
         'chi': chi,
         'sum_index': sum_idx,
         'satisfied': satisfied,
+        'strict': True,
+        'closed': True,
+        'boundary_edges': 0,
         'deficit': deficit,
         'singularities': sing,
         'recommendation': rec,
@@ -1328,16 +1367,18 @@ def verify_holonomy_compatibility(
     """
     sing = detect_singularities_from_crossfield(V, F, u, frames=frames, tol=tol)
     chi = euler_characteristic(V, F)
-    genus = max(0, (2 - chi) // 2)
+    boundary_edges = count_boundary_edges(F)
+    closed = boundary_edges == 0
+    genus = max(0, (2 - chi) // 2) if closed else None
 
     # Check 1: high-order singularities
     indices = sing['indices']
     high_order_count = int(np.sum(np.abs(np.abs(indices) - 0.25) > 0.1))
 
-    # Check 2: co-tree holonomies (skip for genus-0)
+    # Check 2: co-tree holonomies (closed surfaces only; skip for genus-0)
     cotree_violations = 0
     num_cotree_edges = 0
-    if genus > 0:
+    if closed and genus > 0:
         N = len(V)
         a_arr, b_arr, int_mismatch = _compute_edge_integer_mismatches(V, F, u, frames)
         E = len(a_arr)
@@ -1381,7 +1422,13 @@ def verify_holonomy_compatibility(
     compatible = (high_order_count == 0) and (cotree_violations == 0)
 
     if compatible:
-        rec = "Holonomy compatible — field satisfies quadrangulation conditions."
+        if closed:
+            rec = "Holonomy compatible — field satisfies quadrangulation conditions."
+        else:
+            rec = (
+                "Strict global holonomy check skipped for open mesh; "
+                f"high-order singularity check passed ({boundary_edges} boundary edges)."
+            )
     else:
         parts = []
         if high_order_count > 0:
@@ -1398,6 +1445,9 @@ def verify_holonomy_compatibility(
         'high_order_count': high_order_count,
         'cotree_violations': cotree_violations,
         'genus': genus,
+        'closed': closed,
+        'boundary_edges': boundary_edges,
+        'strict_global_check': closed,
         'recommendation': rec,
     }
 
